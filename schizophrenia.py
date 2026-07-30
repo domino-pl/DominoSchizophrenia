@@ -2,6 +2,7 @@
 
 import logging
 from argparse import ArgumentParser
+from enum import StrEnum
 from pathlib import Path
 from sys import exit
 
@@ -13,6 +14,13 @@ logging.basicConfig(level=logging.DEBUG)
 log = logging.getLogger(__name__)
 
 log.setLevel(logging.DEBUG)
+
+
+class ScanAction(StrEnum):
+    START = "start"
+    RESUME = "resume"
+    ABORT = "abort"
+    APPLY = "apply"
 
 
 def add_storage(db: SchizophreniaDB, name: str, storage_abs_path: Path):
@@ -30,8 +38,15 @@ def add_storage(db: SchizophreniaDB, name: str, storage_abs_path: Path):
     log.info(f"Added storage {name} with absolute path {storage_abs_path}.")
 
 
-def scan(db: SchizophreniaDB, storage_name: str):
-    ScanTask(db, storage_name).start()
+def scan(db: SchizophreniaDB, storage_name: str, action: ScanAction):
+
+    scan_task = ScanTask(db, storage_name, allow_resume=action != ScanAction.START)
+
+    match action:
+        case ScanAction.START:
+            scan_task.start()
+        case ScanAction.RESUME:
+            scan_task.resume()
 
 
 def main() -> int:
@@ -46,6 +61,7 @@ def main() -> int:
     add_storage_parser.add_argument("path", type=Path)
 
     scan_parser = commands.add_parser("scan")
+    scan_parser.add_argument("action", choices=ScanAction)
     scan_parser.add_argument("storage_name", type=str)
 
     args = parser.parse_args()
@@ -55,7 +71,8 @@ def main() -> int:
         if args.command == "add_storage":
             add_storage(db, args.storage_name, args.path.absolute())
         elif args.command == "scan":
-            scan(db, args.storage_name)
+            action: ScanAction = args.action
+            scan(db, args.storage_name, action)
 
     finally:
         db.close()

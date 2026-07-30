@@ -27,7 +27,8 @@ class ScanStep(IntEnum):
     LIST = 1
     MATCH = 2
     CHECKSUM = 3
-    APPLY = 4
+    COMPARE = 4
+    APPLY = 5
     ABORT = 255
 
 
@@ -163,6 +164,12 @@ class SchizophreniaDB:
             storage_id=int(row[1]),
             finished_step=ScanStep(row[2]),
         )
+
+    def select_last_storage_scan(self, storage_id: int) -> Scan | None:
+        # TODO ORDER BY TIME
+        sql = "SELECT id FROM scan WHERE storage_id = ? ORDER BY id DESC LIMIT 1"
+        cursor = self.conn.execute(sql, (storage_id,))
+        return self.select_scan(cursor.fetchone()[0]) if cursor.rowcount else None
 
     def insert_scan(self, storage_id: int) -> Scan:
         sql = "INSERT INTO scan(storage_id, finished_step) VALUES (?, ?)"
@@ -306,3 +313,4 @@ class SchizophreniaDB:
         sql = "UPDATE scan SET finished_step=? WHERE id = ?"
         self.conn.execute(sql, (int(new_step), scan_id))
         return self.select_scan(scan_id)
+

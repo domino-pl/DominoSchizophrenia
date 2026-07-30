@@ -3,7 +3,7 @@ from datetime import UTC, datetime, timedelta
 from hashlib import md5, sha256
 from os import stat_result
 
-from src.schizophrenia_db import CheckSums, ListItem, ScanStep, SchizophreniaDB
+from src.schizophrenia_db import CheckSums, ListItem, Scan, ScanStep, SchizophreniaDB
 
 log = logging.getLogger(__name__)
 
@@ -29,22 +29,33 @@ class ScanTask:
         self, db: SchizophreniaDB, storage_name: str, allow_resume: bool = False
     ) -> None:
         self.db = db
-        self.storage = db.select_storage(storage_name)
-        self.scan = self._insert()
+        self.storage = self.db.select_storage(storage_name)
+
+    def _find_last_storage_scan(self) -> Scan | None:
+        return self.db.select_last_storage_scan(self.storage.id)
 
     def _format_mtime(self, stat: stat_result) -> str:
         return datetime.fromtimestamp(
             stat.st_mtime_ns / 1_000_000_000, tz=UTC
         ).isoformat(timespec="microseconds")
 
-    def _insert(self):
+    def _insert_new_scan(self):
+        last_scan = self._find_last_storage_scan()
+        if last_scan is not None and last_scan.finished_step not in (
+            ScanStep.APPLY,
+            ScanStep.APPLY,
+        ):
+            raise RuntimeError("Last scan not finished.")
+
         log.debug("Insert new scan")
-        scan = self.db.insert_scan(self.storage.id)
+        self.db.insert_scan(self.storage.id)
         self.db.commit()
         log.info("New scan inserted")
-        return scan
 
     def _list(self):
+        scan = self._find_last_storage_scan()
+        if scan is None or scan.finished_step != ScanStep.INSERT:
+            raise RuntimeError("Last scan step is not insert.")
 
         log.debug(f"Delete all scan items for storage {self.storage.name}.")
         self.db.delete_all_storage_scan_items(self.storage.id)
@@ -71,31 +82,41 @@ class ScanTask:
             )
 
             if len(new_items) > self.INSERT_SIZE:
-                self.db.insert_scan_items(self.scan, new_items)
+                self.db.insert_scan_items(scan, new_items)
                 log.debug(f"Inserted {len(new_items)} new scan items.")
                 new_items = []
 
-        self.db.insert_scan_items(self.scan, new_items)
+        self.db.insert_scan_items(scan, new_items)
         log.debug(f"Inserted {len(new_items)} new scan items.")
 
-        self.scan = self.db.update_scan_step(self.scan.id, ScanStep.LIST)
+        self.db.update_scan_step(scan.id, ScanStep.LIST)
         log.info("Finished file listing for scan.")
         self.db.commit()
 
-    def _match(self):
-        log.info(f"Match new scan items with known files in storage {self.storage.name}.")
-        self.db.match_scan_files(self.scan)
-        self.scan = self.db.update_scan_step(self.scan.id, ScanStep.MATCH)
+    def _match(self) -> None:
+        scan = self._find_last_storage_scan()
+        if scan is None or scan.finished_step != ScanStep.LIST:
+            raise RuntimeError("Last scan step is not list.")
+
+        log.info(
+            f"Match new scan items with known files in storage {self.storage.name}."
+        )
+        self.db.match_scan_files(scan)
+        self.db.update_scan_step(scan.id, ScanStep.MATCH)
         log.info("Finished matching.")
         self.db.commit()
 
     def _collect_sums(self):
-        #TODO: Progress (per file and total)
+        # TODO: Progress (per file and total)
+        scan = self._find_last_storage_scan()
+        if scan is None or scan.finished_step != ScanStep.MATCH:
+            raise RuntimeError("Last scan step is not match.")
+
         log.info("Start checksums calculation.")
         last_commit_time = datetime.now(tz=UTC)
         new_sums: list[CheckSums] = []
         while True:
-            files = self.db.select_files_for_checksum_calculation(self.scan)
+            files = self.db.select_files_for_checksum_calculation(scan)
 
             if len(files) == 0:
                 break
@@ -119,7 +140,9 @@ class ScanTask:
                     )
                 )
 
-                log.debug(f"Calculated sums: md5={new_sums[-1].md5}, sha256={new_sums[-1].sha256}.")
+                log.debug(
+                    f"Calculated sums: md5={new_sums[-1].md5}, sha256={new_sums[-1].sha256}."
+                )
 
                 if datetime.now(tz=UTC) > last_commit_time + timedelta(
                     seconds=self.CHECKSUMS_COMMIT_INTERVAL_S
@@ -132,25 +155,52 @@ class ScanTask:
             self.db.update_scan_items_sum(new_sums)
             self.db.commit()
 
-            self.db.update_scan_items_content_changed(self.scan)
+            self.db.update_scan_step(scan.id, ScanStep.CHECKSUM)
             self.db.commit()
 
-            self.scan = self.db.update_scan_step(self.scan.id, ScanStep.CHECKSUM)
-            self.db.commit()
+    def _compare(self):
+        scan = self._find_last_storage_scan()
+        if scan is None or scan.finished_step != ScanStep.CHECKSUM:
+            raise RuntimeError("Last scan step is not checksum.")
 
+        log.info(
+            f"Compare new scan items content with known files in storage {self.storage.name}."
+        )
+        self.db.update_scan_items_content_changed(scan)
+        self.db.update_scan_step(scan.id, ScanStep.COMPARE)
+        self.db.commit()
+        log.info("Finished comparing new scan items.")
 
-    def start(self) -> None:
-        if self.scan.finished_step > ScanStep.LIST:
+    def _start(self) -> None:
+        self._insert_new_scan()
+        self._resume()
+
+    def _resume(self) -> None:
+        last_scan = self._find_last_storage_scan()
+        last_step = last_scan.finished_step if last_scan else None
+
+        if last_step and last_step >= ScanStep.LIST:
             log.info("Files already listed for scan.")
         else:
             self._list()
 
-        if self.scan.finished_step > ScanStep.MATCH:
+        if last_step and last_step >= ScanStep.MATCH:
             log.info("Files already matched for scan.")
         else:
             self._match()
 
-        if self.scan.finished_step > ScanStep.CHECKSUM:
+        if last_step and last_step >= ScanStep.CHECKSUM:
             log.info("Checksum already calculated for scan.")
         else:
             self._collect_sums()
+
+        if last_step and last_step >= ScanStep.COMPARE:
+            log.info("Content already compared for scan.")
+        else:
+            self._compare()
+
+    def start(self) -> None:
+        self._start()
+
+    def resume(self) -> None:
+        self._resume()
