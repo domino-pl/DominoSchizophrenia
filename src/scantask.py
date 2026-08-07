@@ -41,9 +41,9 @@ class ScanTask:
 
     def _insert_new_scan(self):
         last_scan = self._find_last_storage_scan()
-        if last_scan is not None and last_scan.finished_step not in (
+        if last_scan and last_scan.finished_step not in (
             ScanStep.APPLY,
-            ScanStep.APPLY,
+            ScanStep.ABORT,
         ):
             raise RuntimeError("Last scan not finished.")
 

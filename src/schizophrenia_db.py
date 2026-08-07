@@ -169,7 +169,8 @@ class SchizophreniaDB:
         # TODO ORDER BY TIME
         sql = "SELECT id FROM scan WHERE storage_id = ? ORDER BY id DESC LIMIT 1"
         cursor = self.conn.execute(sql, (storage_id,))
-        return self.select_scan(cursor.fetchone()[0]) if cursor.rowcount else None
+        row = cursor.fetchone()
+        return self.select_scan(row[0]) if row else None
 
     def insert_scan(self, storage_id: int) -> Scan:
         sql = "INSERT INTO scan(storage_id, finished_step) VALUES (?, ?)"
