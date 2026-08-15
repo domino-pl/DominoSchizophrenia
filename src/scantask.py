@@ -204,3 +204,18 @@ class ScanTask:
 
     def resume(self) -> None:
         self._resume()
+
+    def apply(self) -> None:
+        scan = self._find_last_storage_scan()
+        if scan is None:
+            raise RuntimeError("No scan.")
+
+        if scan.finished_step != ScanStep.COMPARE:
+            raise RuntimeError("Scan is not ready to apply.")
+
+        self.db.delete_file_records_scanned_as_deleted(scan.id)
+        self.db.update_file_records_with_meta_changed(scan.id)
+        self.db.update_file_records_with_content_changed(scan.id)
+        self.db.insert_new_scanned_file_records(scan.id)
+        self.db.update_scan_step(scan.id, ScanStep.APPLY)
+        self.db.commit()

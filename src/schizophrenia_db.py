@@ -315,3 +315,61 @@ class SchizophreniaDB:
         self.conn.execute(sql, (int(new_step), scan_id))
         return self.select_scan(scan_id)
 
+    def delete_file_records_scanned_as_deleted(self, scan_id: int) -> int:
+        sql = "DELETE FROM file WHERE id IN(SELECT file_id FROM scan_item WHERE scan_id = ? AND status = ?)"
+
+        log.debug(
+            f"Removing file records of files scanned as deleted for scan {scan_id}."
+        )
+        cursor = self.conn.execute(sql, (scan_id, int(FileStatus.REMOVED)))
+        log.debug(
+            f"Removed {cursor.rowcount} file records of files scanned as deleted."
+        )
+        return cursor.rowcount
+
+    def update_file_records_with_meta_changed(self, scan_id: int):
+        sql = """UPDATE file
+                 SET size=scan_item.size,
+                     mtime=scan_item.mtime
+                 FROM scan_item
+                 WHERE file.id = scan_item.file_id
+                   AND scan_item.scan_id = ?
+                   AND scan_item.status = ?
+              """
+
+        log.debug(f"Updating file records witch changed meta for scan {scan_id}.")
+        cursor = self.conn.execute(sql, (scan_id, int(FileStatus.META_CHANGED)))
+        log.debug(f"Updated {cursor.rowcount} file records wich changed meta.")
+        return cursor.rowcount
+
+    def update_file_records_with_content_changed(self, scan_id: int):
+        sql = """UPDATE file
+                 SET size=scan_item.size,
+                     mtime=scan_item.mtime,
+                     md5=scan_item.md5,
+                     sha256=scan_item.sha256
+                 FROM scan_item
+                 WHERE file.id = scan_item.file_id
+                   AND scan_item.scan_id = ?
+                   AND scan_item.status = ?
+              """
+
+        log.debug(f"Updating file records witch changed content for scan {scan_id}.")
+        cursor = self.conn.execute(sql, (scan_id, int(FileStatus.CONTENT_CHANGED)))
+        log.debug(f"Updated {cursor.rowcount} file records wich content changed.")
+        return cursor.rowcount
+        
+
+    def insert_new_scanned_file_records(self, scan_id: int) -> int:
+        sql = """
+              INSERT INTO file(storage_id, rel_path, size, mtime, md5, sha256)
+              SELECT
+                  scan.storage_id, scan_item.rel_path, scan_item.size, scan_item.mtime, scan_item.md5, scan_item.sha256
+              FROM scan
+                       JOIN scan_item ON scan.id = scan_item.scan_id
+              WHERE scan.id = ? AND scan_item.status = ?
+              """
+
+        log.debug(f"Inserting new file records for files scanned in scan {scan_id}.")
+        cursor = self.conn.execute(sql, (scan_id, int(FileStatus.NEW)))
+        log.debug(f"Inserted {cursor.rowcount} new file records.")
