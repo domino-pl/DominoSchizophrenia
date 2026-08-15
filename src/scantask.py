@@ -171,6 +171,16 @@ class ScanTask:
         self.db.commit()
         log.info("Finished comparing new scan items.")
 
+    def _assign_uid(self):
+        scan = self._find_last_storage_scan()
+        if scan is None or scan.finished_step != ScanStep.COMPARE:
+            raise RuntimeError("Last scan step is not checksum.")
+
+        # TODO. log
+        self.db.assign_scan_new_uid(scan.id)
+        self.db.commit()
+        log.info("Finished assigning UID.")
+
     def _start(self) -> None:
         self._insert_new_scan()
         self._resume()
@@ -198,6 +208,11 @@ class ScanTask:
             log.info("Content already compared for scan.")
         else:
             self._compare()
+        
+        if last_step and last_step >= ScanStep.ASSIGN_UID:
+            log.info("UID already assigned for scan.")
+        else:
+            self._assign_uid()
 
     def start(self) -> None:
         self._start()

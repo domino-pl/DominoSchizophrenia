@@ -28,7 +28,8 @@ class ScanStep(IntEnum):
     MATCH = 2
     CHECKSUM = 3
     COMPARE = 4
-    APPLY = 5
+    ASSIGN_UID = 5
+    APPLY = 6
     ABORT = 255
 
 
@@ -79,11 +80,24 @@ class SchizophreniaDB:
             )
             """,
             """
+            CREATE TABLE IF NOT EXISTS uids
+            (
+                uid      INTEGER PRIMARY KEY AUTOINCREMENT,
+                size       INTEGER NOT NULL,
+                md5        TEXT    NOT NULL,
+                sha256     TEXT    NOT NULL
+            )
+            """,
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uids_uidx_size_md5_sha256 ON uids(size, md5, sha256)
+            """,
+            """
             CREATE TABLE IF NOT EXISTS file
             (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 storage_id INTEGER NOT NULL,
                 rel_path   TEXT    NOT NULL,
+                uid        INTEGER NOT NULL,
                 size       INTEGER NOT NULL,
                 mtime      INTEGER NOT NULL,
                 md5        TEXT    NOT NULL,
@@ -92,6 +106,9 @@ class SchizophreniaDB:
             """,
             """
             CREATE UNIQUE INDEX IF NOT EXISTS file_unique_idx_storage_path ON file(storage_id, rel_path)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_file_uid ON file(uid)
             """,
             """
             CREATE TABLE IF NOT EXISTS scan
@@ -108,6 +125,7 @@ class SchizophreniaDB:
                 scan_id  INTEGER NOT NULL,
                 file_id  INTEGER NULL,
                 rel_path TEXT    NOT NULL,
+                uid      INTEGER NULL,
                 size     INTEGER NOT NULL,
                 mtime    TEXT    NOT NULL,
                 status   INTEGER NOT NULL,
@@ -222,10 +240,11 @@ class SchizophreniaDB:
 
         log.debug("Looking for deleted files.")
         sql = """
-              INSERT INTO scan_item(scan_id, file_id, rel_path, size, mtime, md5, sha256, status)
+              INSERT INTO scan_item(scan_id, file_id, rel_path, uid, size, mtime, md5, sha256, status)
               SELECT ?,
                      id,
                      rel_path,
+                     uid,
                      size,
                      mtime,
                      md5,
@@ -243,19 +262,18 @@ class SchizophreniaDB:
         log.debug("Mark not modified files.")
         sql = """
               UPDATE scan_item
-              SET status=?
-              WHERE scan_id = ?
-                AND id IN (SELECT scan_item.id
-                           FROM scan_item
-                                    JOIN file ON file.id = scan_item.file_id
-                           WHERE scan_item.scan_id = ?
-                             AND scan_item.status = ?
-                             AND scan_item.size = file.size
-                             AND scan_item.mtime = file.mtime)
+              SET status=?,
+                  uid=file.uid
+              FROM file
+              WHERE scan_item.scan_id = ?
+                AND scan_item.status = ?
+                AND scan_item.file_id = file.id
+                AND scan_item.size = file.size
+                AND scan_item.mtime = file.mtime
               """
         cursor = self.conn.execute(
             sql,
-            (int(FileStatus.NOT_CHANGED), scan.id, scan.id, int(FileStatus.UNKNOWN)),
+            (int(FileStatus.NOT_CHANGED), scan.id, int(FileStatus.UNKNOWN)),
         )
         log.debug(f"Found {cursor.rowcount} not modified files.")
 
@@ -292,22 +310,49 @@ class SchizophreniaDB:
     def update_scan_items_content_changed(self, scan: Scan):
         sql = """
               UPDATE scan_item
-              SET status=?
-              WHERE id IN (SELECT scan_item.id
-                           FROM scan_item
-                                    JOIN file ON file.id = scan_item.file_id
-                           WHERE scan_item.scan_id = ?
-                             AND scan_item.status = ?
-                             AND (scan_item.size != file.size OR scan_item.md5 != file.md5 OR
-                                  scan_item.sha256 != file.sha256))
+              SET status=?,
+                  uid=file.uid
+              FROM file
+              WHERE scan_item.scan_id = ?
+                AND scan_item.status = ?
+                AND scan_item.file_id = file.id
+                AND scan_item.size = file.size
+                AND scan_item.md5 = file.md5
+                AND scan_item.sha256 = file.sha256
               """
         self.conn.execute(
-            sql, (int(FileStatus.CONTENT_CHANGED), scan.id, int(FileStatus.UNKNOWN))
+            sql, (int(FileStatus.META_CHANGED), scan.id, int(FileStatus.UNKNOWN))
         )
 
         sql = "UPDATE scan_item SET status=? WHERE scan_id = ? AND status = ?"
         self.conn.execute(
-            sql, (int(FileStatus.META_CHANGED), scan.id, int(FileStatus.UNKNOWN))
+            sql, (int(FileStatus.CONTENT_CHANGED), scan.id, int(FileStatus.UNKNOWN))
+        )
+
+    def assign_scan_new_uid(self, scan_id: int):
+        sql = """
+              INSERT OR IGNORE INTO uids(size, md5, sha256)
+              SELECT size, md5, sha256
+              FROM scan_item
+              WHERE scan_id = ?
+                AND uid IS NULL
+              """
+        self.conn.execute(
+            sql, (scan_id,)
+        )
+
+        sql = """
+              UPDATE scan_item
+              SET uid=uids.uid
+              FROM uids
+              WHERE scan_item.scan_id = ?
+                AND scan_item.uid IS NULL
+                AND scan_item.size = uids.size
+                AND scan_item.md5 = uids.md5
+                AND scan_item.sha256 = uids.sha256
+              """
+        self.conn.execute(
+            sql, (scan_id,)
         )
 
     def update_scan_step(self, scan_id: int, new_step: ScanStep) -> Scan:
@@ -358,16 +403,21 @@ class SchizophreniaDB:
         cursor = self.conn.execute(sql, (scan_id, int(FileStatus.CONTENT_CHANGED)))
         log.debug(f"Updated {cursor.rowcount} file records wich content changed.")
         return cursor.rowcount
-        
 
     def insert_new_scanned_file_records(self, scan_id: int) -> int:
         sql = """
-              INSERT INTO file(storage_id, rel_path, size, mtime, md5, sha256)
-              SELECT
-                  scan.storage_id, scan_item.rel_path, scan_item.size, scan_item.mtime, scan_item.md5, scan_item.sha256
+              INSERT INTO file(storage_id, rel_path, uid, size, mtime, md5, sha256)
+              SELECT scan.storage_id,
+                     scan_item.rel_path,
+                     scan_item.uid,
+                     scan_item.size,
+                     scan_item.mtime,
+                     scan_item.md5,
+                     scan_item.sha256
               FROM scan
                        JOIN scan_item ON scan.id = scan_item.scan_id
-              WHERE scan.id = ? AND scan_item.status = ?
+              WHERE scan.id = ?
+                AND scan_item.status = ?
               """
 
         log.debug(f"Inserting new file records for files scanned in scan {scan_id}.")
