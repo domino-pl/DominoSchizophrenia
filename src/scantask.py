@@ -2,22 +2,13 @@ import logging
 from datetime import UTC, datetime, timedelta
 from hashlib import md5, sha256
 from os import stat_result
+from pathlib import PurePosixPath
 
-from src.schizophrenia_db import CheckSums, ListItem, Scan, ScanStep, SchizophreniaDB
+from src.db import SchizophreniaDB
+from src.db.scan import Scan, ScanItemCheckSums, ScanListItem, ScanStep
+from src.tools import format_mtime, format_size
 
 log = logging.getLogger(__name__)
-
-
-def format_size(size_bytes: int) -> str:
-    units = ("B", "KiB", "MiB", "GiB", "TiB", "PiB")
-
-    size = float(size_bytes)
-    for unit in units:
-        if size < 1024 or unit == units[-1]:
-            return f"{int(size)} {unit}" if unit == "B" else f"{size:.2f} {unit}"
-        size /= 1024
-
-    raise AssertionError("unreachable")
 
 
 class ScanTask:
@@ -25,19 +16,12 @@ class ScanTask:
     CHUNK_SIZE = 1024 * 1024
     CHECKSUMS_COMMIT_INTERVAL_S = 60
 
-    def __init__(
-        self, db: SchizophreniaDB, storage_name: str, allow_resume: bool = False
-    ) -> None:
+    def __init__(self, db: SchizophreniaDB, storage_name: str) -> None:
         self.db = db
         self.storage = self.db.select_storage(storage_name)
 
     def _find_last_storage_scan(self) -> Scan | None:
-        return self.db.select_last_storage_scan(self.storage.id)
-
-    def _format_mtime(self, stat: stat_result) -> str:
-        return datetime.fromtimestamp(
-            stat.st_mtime_ns / 1_000_000_000, tz=UTC
-        ).isoformat(timespec="microseconds")
+        return self.db.scan_select_last_for_storage(self.storage.id)
 
     def _insert_new_scan(self):
         last_scan = self._find_last_storage_scan()
@@ -48,7 +32,7 @@ class ScanTask:
             raise RuntimeError("Last scan not finished.")
 
         log.debug("Insert new scan")
-        self.db.insert_scan(self.storage.id)
+        self.db.scan_insert(self.storage.id)
         self.db.commit()
         log.info("New scan inserted")
 
@@ -58,22 +42,24 @@ class ScanTask:
             raise RuntimeError("Last scan step is not insert.")
 
         log.debug(f"Delete all scan items for storage {self.storage.name}.")
-        self.db.delete_all_storage_scan_items(self.storage.id)
+        self.db.scan_delete_all_storage_scan_items(self.storage.id)
 
         log.info(
             f"Begin file listing for storage {self.storage.name} in '{self.storage.abs_path}'."
         )
-        new_items: list[ListItem] = []
+        new_items: list[ScanListItem] = []
         for file_path in self.storage.abs_path.rglob("*"):
             if file_path.is_symlink() or not file_path.is_file():
                 continue
 
             stat = file_path.stat()
             new_items.append(
-                ListItem(
-                    rel_path=file_path.relative_to(self.storage.abs_path),
+                ScanListItem(
+                    rel_path=PurePosixPath(
+                        file_path.relative_to(self.storage.abs_path).as_posix()
+                    ),
                     size=stat.st_size,
-                    mtime=self._format_mtime(stat),
+                    mtime=format_mtime(stat),
                 )
             )
 
@@ -82,14 +68,14 @@ class ScanTask:
             )
 
             if len(new_items) > self.INSERT_SIZE:
-                self.db.insert_scan_items(scan, new_items)
+                self.db.scan_insert_scan_items(scan, new_items)
                 log.debug(f"Inserted {len(new_items)} new scan items.")
                 new_items = []
 
-        self.db.insert_scan_items(scan, new_items)
+        self.db.scan_insert_scan_items(scan, new_items)
         log.debug(f"Inserted {len(new_items)} new scan items.")
 
-        self.db.update_scan_step(scan.id, ScanStep.LIST)
+        self.db.scan_update_step(scan.id, ScanStep.LIST)
         log.info("Finished file listing for scan.")
         self.db.commit()
 
@@ -101,8 +87,8 @@ class ScanTask:
         log.info(
             f"Match new scan items with known files in storage {self.storage.name}."
         )
-        self.db.match_scan_files(scan)
-        self.db.update_scan_step(scan.id, ScanStep.MATCH)
+        self.db.scan_match_files(scan)
+        self.db.scan_update_step(scan.id, ScanStep.MATCH)
         log.info("Finished matching.")
         self.db.commit()
 
@@ -114,9 +100,9 @@ class ScanTask:
 
         log.info("Start checksums calculation.")
         last_commit_time = datetime.now(tz=UTC)
-        new_sums: list[CheckSums] = []
+        new_sums: list[ScanItemCheckSums] = []
         while True:
-            files = self.db.select_files_for_checksum_calculation(scan)
+            files = self.db.scan_select_files_for_checksum_calculation(scan)
 
             if len(files) == 0:
                 break
@@ -133,7 +119,7 @@ class ScanTask:
                         sha256_hash.update(chunk)
 
                 new_sums.append(
-                    CheckSums(
+                    ScanItemCheckSums(
                         item_id=file_info.item_id,
                         md5=md5_hash.hexdigest(),
                         sha256=sha256_hash.hexdigest(),
@@ -147,15 +133,15 @@ class ScanTask:
                 if datetime.now(tz=UTC) > last_commit_time + timedelta(
                     seconds=self.CHECKSUMS_COMMIT_INTERVAL_S
                 ):
-                    self.db.update_scan_items_sum(new_sums)
+                    self.db.scan_update_scan_items_sum(new_sums)
                     self.db.commit()
                     new_sums = []
                     last_commit_time = datetime.now(tz=UTC)
 
-            self.db.update_scan_items_sum(new_sums)
+            self.db.scan_update_scan_items_sum(new_sums)
             self.db.commit()
 
-            self.db.update_scan_step(scan.id, ScanStep.CHECKSUM)
+            self.db.scan_update_step(scan.id, ScanStep.CHECKSUM)
             self.db.commit()
 
     def _compare(self):
@@ -166,8 +152,8 @@ class ScanTask:
         log.info(
             f"Compare new scan items content with known files in storage {self.storage.name}."
         )
-        self.db.update_scan_items_content_changed(scan)
-        self.db.update_scan_step(scan.id, ScanStep.COMPARE)
+        self.db.scan_update_scan_items_content_changed(scan)
+        self.db.scan_update_step(scan.id, ScanStep.COMPARE)
         self.db.commit()
         log.info("Finished comparing new scan items.")
 
@@ -177,7 +163,8 @@ class ScanTask:
             raise RuntimeError("Last scan step is not checksum.")
 
         # TODO. log
-        self.db.assign_scan_new_uid(scan.id)
+        self.db.scan_assign_scan_new_uid(scan.id)
+        self.db.scan_update_step(scan.id, ScanStep.ASSIGN_UID)
         self.db.commit()
         log.info("Finished assigning UID.")
 
@@ -208,7 +195,7 @@ class ScanTask:
             log.info("Content already compared for scan.")
         else:
             self._compare()
-        
+
         if last_step and last_step >= ScanStep.ASSIGN_UID:
             log.info("UID already assigned for scan.")
         else:
@@ -228,9 +215,9 @@ class ScanTask:
         if scan.finished_step != ScanStep.COMPARE:
             raise RuntimeError("Scan is not ready to apply.")
 
-        self.db.delete_file_records_scanned_as_deleted(scan.id)
-        self.db.update_file_records_with_meta_changed(scan.id)
-        self.db.update_file_records_with_content_changed(scan.id)
-        self.db.insert_new_scanned_file_records(scan.id)
-        self.db.update_scan_step(scan.id, ScanStep.APPLY)
+        self.db.scan_delete_file_records_scanned_as_deleted(scan.id)
+        self.db.scan_update_file_records_with_meta_changed(scan.id)
+        self.db.scan_update_file_records_with_content_changed(scan.id)
+        self.db.scan_insert_new_scanned_file_records(scan.id)
+        self.db.scan_update_step(scan.id, ScanStep.APPLY)
         self.db.commit()

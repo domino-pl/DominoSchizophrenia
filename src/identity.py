@@ -20,7 +20,7 @@ class Identity:
     def get_real_path(storage_path: Path) -> Path:
         return storage_path / IDENTITY_FILE_NAME
 
-    def _to_str(self) -> str:
+    def to_str(self) -> str:
         return str(self.uuid)
 
     @staticmethod
@@ -32,7 +32,7 @@ class Identity:
         return Identity(str(uuid.uuid4()))
 
     def to_db(self) -> str:
-        return self._to_str()
+        return self.to_str()
 
     @staticmethod
     def from_db(identity_str: str) -> Identity:
@@ -47,7 +47,7 @@ class Identity:
             raise FileExistsError(file_path)
 
         with open(file_path, "w") as f:
-            f.write(self._to_str())
+            f.write(self.to_str())
 
     @staticmethod
     def read_from_storage_dir(storage_path: Path) -> Identity:

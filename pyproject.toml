@@ -6,3 +6,30 @@ dependencies = [
     "ruff",
     "ty",
 ]
+
+[tool.ruff]
+target-version = "py314"
+preview = true
+unsafe-fixes = true
+show-fixes = true
+force-exclude = true
+
+[tool.ruff.lint]
+select = ["ALL"]
+explicit-preview-rules = false
+ignore = [
+    #    "D203", # Incompatible with D211.
+    #    "D213", # Incompatible with D212.
+]
+
+[tool.ty.environment]
+python-version = "3.14"
+
+[tool.ty.src]
+respect-ignore-files = true
+
+[tool.ty.rules]
+all = "error"
+
+[tool.ty.analysis]
+strict-literal-narrowing = true
