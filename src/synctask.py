@@ -206,7 +206,9 @@ class SyncFSBaseAction:
 
         stat = os.stat(src_file)
         if format_mtime(stat) != self.file_info.mtime:
-            raise Exception(src_file)  # TODO: ex
+            print(f"Bad mtime for {src_file} - wanted {format_mtime(stat)} - got {self.file_info.mtime}.")
+            if(input() != 'y'):
+                raise Exception(src_file)  # TODO: ex
         if stat.st_size != self.file_info.size:
             raise Exception(src_file)  # TODO: ex
 
