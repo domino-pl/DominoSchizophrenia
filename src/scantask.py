@@ -4,9 +4,11 @@ from hashlib import md5, sha256
 from os import stat_result
 from pathlib import PurePosixPath
 
+from src.identity import IDENTITY_FILE_NAME
 from src.db import SchizophreniaDB
 from src.db.scan import Scan, ScanItemCheckSums, ScanListItem, ScanStep
 from src.tools import format_mtime, format_size
+import stat
 
 log = logging.getLogger(__name__)
 
@@ -48,29 +50,46 @@ class ScanTask:
             f"Begin file listing for storage {self.storage.name} in '{self.storage.abs_path}'."
         )
         new_items: list[ScanListItem] = []
-        for file_path in self.storage.abs_path.rglob("*"):
-            if file_path.is_symlink() or not file_path.is_file():
-                continue
+        for current_dir, dirnames, filenames in self.storage.abs_path.walk(top_down=True, on_error=None, follow_symlinks=False):
+            for subdir in dirnames:
+                if subdir not in ["System Volume Information", "$RECYCLE.BIN"]:
+                    continue
+                subdir_path = current_dir/subdir
+                attrs = subdir_path.stat(follow_symlinks=False).st_file_attributes
+                if attrs & stat.FILE_ATTRIBUTE_SYSTEM:
+                    log.info(f"Skipping SYSTEM file/dir {subdir_path}.")
+                    dirnames.remove(subdir)
+                else:
+                    log.info(f"File/dir {subdir_path} won't be skipped - not mark as SYSTEM.")
 
-            stat = file_path.stat()
-            new_items.append(
-                ScanListItem(
-                    rel_path=PurePosixPath(
-                        file_path.relative_to(self.storage.abs_path).as_posix()
-                    ),
-                    size=stat.st_size,
-                    mtime=format_mtime(stat),
+            for file in filenames:
+                if current_dir == self.storage.abs_path and file == IDENTITY_FILE_NAME:
+                    logging.info(f"Skipping identity file {IDENTITY_FILE_NAME} in {IDENTITY_FILE_NAME}.")
+                    continue
+
+                file_path = current_dir / file
+                if file_path.is_symlink() or not file_path.is_file():
+                    raise Exception(f"{file_path} is not a regular file")
+
+                file_stat = file_path.stat()
+                new_items.append(
+                    ScanListItem(
+                        rel_path=PurePosixPath(
+                            file_path.relative_to(self.storage.abs_path).as_posix()
+                        ),
+                        size=file_stat.st_size,
+                        mtime=format_mtime(file_stat),
+                    )
                 )
-            )
 
-            log.debug(
-                f"Found file '{new_items[-1].rel_path}' (size={format_size(new_items[-1].size)}, mtime={new_items[-1].mtime})."
-            )
+                log.debug(
+                    f"Found file '{new_items[-1].rel_path}' (size={format_size(new_items[-1].size)}, mtime={new_items[-1].mtime})."
+                )
 
-            if len(new_items) > self.INSERT_SIZE:
-                self.db.scan_insert_scan_items(scan, new_items)
-                log.debug(f"Inserted {len(new_items)} new scan items.")
-                new_items = []
+                if len(new_items) > self.INSERT_SIZE:
+                    self.db.scan_insert_scan_items(scan, new_items)
+                    log.debug(f"Inserted {len(new_items)} new scan items.")
+                    new_items = []
 
         self.db.scan_insert_scan_items(scan, new_items)
         log.debug(f"Inserted {len(new_items)} new scan items.")
