@@ -14,19 +14,23 @@ IDENTITY_FILE_NAME = "schizophrenia.identity"
 class Identity:
     """Represent a storage identity backed by a UUID."""
 
+    __hash__ = None
+
     def __init__(self, identity_str: str) -> None:
         """Initialize the identity from a valid UUID string."""
         self.uuid = uuid.UUID(identity_str)
 
     @override
     def __eq__(self, other: object) -> bool:
-        """Compare UUIDs with another object exposing an `uuid` attribute.
+        """Compare UUIDs with another identity.
 
         Returns:
-            Whether the UUIDs are equal.
+            Whether the UUIDs are equal, or NotImplemented for other types.
 
         """
-        return self.uuid == other.__getattribute__("uuid")
+        if not isinstance(other, Identity):
+            return NotImplemented
+        return self.uuid == other.uuid
 
     @classmethod
     def get_file_name(cls) -> str:
@@ -108,6 +112,8 @@ class Identity:
     def save_to_storage_dir(self, storage_abs_path: Path) -> None:
         """Write the identity to an existing storage directory.
 
+        Create the file exclusively.
+
         Args:
             storage_abs_path: Directory in which to create the identity file.
 
@@ -115,15 +121,13 @@ class Identity:
             FileNotFoundError: If the storage path is not an existing directory.
             FileExistsError: If an identity file already exists.
 
-        """
+        """  # ruff: ignore[docstring-extraneous-exception]
         if not storage_abs_path.is_dir():
             raise FileNotFoundError(storage_abs_path)
 
         file_path = self.get_real_path(storage_abs_path)
-        if file_path.exists():
-            raise FileExistsError(file_path)
-
-        Path(file_path).write_text(self.to_str(), encoding="utf-8")
+        with file_path.open("x", encoding="utf-8") as identity_file:
+            identity_file.write(self.to_str())
 
     @staticmethod
     def read_from_storage_dir(storage_path: Path) -> Identity:
