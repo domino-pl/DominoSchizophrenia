@@ -231,7 +231,7 @@ class ScanTask:
         if scan is None:
             raise RuntimeError("No scan.")
 
-        if scan.finished_step != ScanStep.COMPARE:
+        if scan.finished_step != ScanStep.ASSIGN_UID:
             raise RuntimeError("Scan is not ready to apply.")
 
         self.db.scan_delete_file_records_scanned_as_deleted(scan.id)
