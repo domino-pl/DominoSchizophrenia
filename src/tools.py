@@ -3,9 +3,10 @@
 """Common utils."""
 
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import md5, sha256
 from os import stat_result
+from shutil import SameFileError
 from typing import TYPE_CHECKING, NamedTuple
 
 if TYPE_CHECKING:
@@ -45,12 +46,14 @@ def format_mtime(stat: stat_result) -> str:
         stat: File metadata containing the modification time in nanoseconds.
 
     Returns:
-        A timestamp with microsecond precision and the ``+00:00`` UTC offset.
+        A timestamp truncated to microseconds with the ``+00:00`` UTC offset.
 
     """
-    return datetime.fromtimestamp(stat.st_mtime_ns / 1_000_000_000, tz=UTC).isoformat(
-        timespec="microseconds",
+    seconds, nanoseconds = divmod(stat.st_mtime_ns, 1_000_000_000)
+    timestamp = datetime.fromtimestamp(seconds, tz=UTC) + timedelta(
+        microseconds=nanoseconds // 1000,
     )
+    return timestamp.isoformat(timespec="microseconds")
 
 
 class CopyResult(NamedTuple):
@@ -80,7 +83,19 @@ def copy_with_hashes(
     Returns:
         The copied byte count and hexadecimal MD5 and SHA-256 digests.
 
+    Raises:
+        SameFileError: If source and destination refer to the same file.
+        ValueError: If chunk_size is not positive.
+
     """
+    if chunk_size <= 0:
+        msg = "chunk_size must be positive"
+        raise ValueError(msg)
+
+    if destination.exists() and source.samefile(destination):
+        msg = "Source and destination refer to the same file"
+        raise SameFileError(msg)
+
     md5_hash = md5()  # ruff: ignore[hashlib-insecure-hash-function]
     sha256_hash = sha256()
     copied_size = 0
