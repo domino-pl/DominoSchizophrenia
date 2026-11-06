@@ -7,6 +7,7 @@ from enum import IntEnum
 from pathlib import PurePosixPath
 from typing import NamedTuple, override
 
+from src.db.base import FetchEmptyError
 from src.db.file import SchizophreniaDBFile
 
 log = logging.getLogger(__name__)
@@ -124,10 +125,15 @@ class SchizophreniaDBScan(SchizophreniaDBFile):
         Returns:
             The matching scan record.
 
+        Raises:
+            FetchEmptyError: If no scan with the given ID exists.
+
         """
         sql = "SELECT id, storage_id, finished_step FROM scan WHERE id = ?"
         cursor = self.conn.execute(sql, (scan_id,))
         row = cursor.fetchone()
+        if row is None:
+            raise FetchEmptyError
         return Scan(
             id=int(row[0]),
             storage_id=int(row[1]),
@@ -364,11 +370,12 @@ class SchizophreniaDBScan(SchizophreniaDBFile):
         """Create missing content identities and assign UIDs by size and checksums."""
         # Reuse existing identities instead of duplicating the same content tuple.
         sql = """
-              INSERT OR IGNORE INTO uids(size, md5, sha256)
+              INSERT INTO uids(size, md5, sha256)
               SELECT size, md5, sha256
               FROM scan_item
               WHERE scan_id = ?
                 AND uid IS NULL
+              ON CONFLICT(size, md5, sha256) DO NOTHING
               """
         self.conn.execute(sql, (scan_id,))
 

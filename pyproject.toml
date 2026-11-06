@@ -20,6 +20,8 @@ explicit-preview-rules = false
 ignore = [
     #    "D203", # Incompatible with D211.
     #    "D213", # Incompatible with D212.
+    "TD002", # missing-to-do-author
+    "TD003", # missing-to-do-link
 ]
 
 [tool.ty.environment]

@@ -51,10 +51,7 @@ class SchizophreniaDBFile(SchizophreniaDBStorage):
             # A relative path must be unique within a storage.
             """
             CREATE UNIQUE INDEX IF NOT EXISTS
-                file_unique_idx_storage_path ON file (
-                                                      storage_id,
-                                                      rel_path
-                )
+                file_unique_idx_storage_path ON file (storage_id, rel_path)
             """,
             # Speed up lookups of files sharing the same content identifier.
             """
