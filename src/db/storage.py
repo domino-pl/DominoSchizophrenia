@@ -24,7 +24,7 @@ class Storage(NamedTuple):
 class SchizophreniaDBStorage(SchizophreniaDBBase):
     """Manage persistent storage configuration records.
 
-    Part of the database inheritance chain.
+    Part of the database schema inheritance chain.
     """
 
     @override
