@@ -16,6 +16,10 @@ class InsertVerificationError(RuntimeError):
     """Indicate that an expected single-row insert could not be verified."""
 
 
+class FetchEmptyError(LookupError):
+    """Indicate that an expected database row was not found."""
+
+
 class SchizophreniaDBBase:
     """Provide the foundation for successive database subclasses.
 

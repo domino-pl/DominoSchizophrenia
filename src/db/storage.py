@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 from typing import NamedTuple, override
 
-from src.db.base import SchizophreniaDBBase
+from src.db.base import FetchEmptyError, SchizophreniaDBBase
 from src.identity import Identity
 
 log = logging.getLogger(__name__)
@@ -52,10 +52,15 @@ class SchizophreniaDBStorage(SchizophreniaDBBase):
         Returns:
             The matching storage record with its path and identity decoded.
 
+        Raises:
+            FetchEmptyError: If no storage with the given name exists.
+
         """
         sql = "SELECT id, name, abs_path, identity FROM storage WHERE name = ?"
         cursor = self.conn.execute(sql, (storage_name,))
         row = cursor.fetchone()
+        if row is None:
+            raise FetchEmptyError
         return Storage(
             id=int(row[0]),
             name=str(row[1]),
@@ -65,6 +70,9 @@ class SchizophreniaDBStorage(SchizophreniaDBBase):
 
     def insert_storage(self, name: str, abs_path: Path, identity: Identity) -> Storage:
         """Persist a storage configuration and return the saved record.
+
+        Commit the entire current transaction, including any pending changes
+        made earlier on the same connection.
 
         Returns:
             The saved storage record, including its database-generated ID.
