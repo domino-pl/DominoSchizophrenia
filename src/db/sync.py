@@ -1,17 +1,25 @@
+# Copyright (c) 2026 Dominik Przybysz <dominik@przybysz.dev>
+
+"""Build synchronization plans from stored file paths and content identities."""
+
 import logging
-from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import PurePosixPath
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 from src.db.scan import SchizophreniaDBScan
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
 class SyncFileMeta:
+    """Immutable file identifier, metadata, and checksums."""
+
     id: int
     mtime: str
     size: int
@@ -21,12 +29,15 @@ class SyncFileMeta:
 
 @dataclass(frozen=True)
 class SyncFileInfo(SyncFileMeta):
+    """File metadata extended with content identity, path, and move target ID."""
+
     uid: int
     rel_path: PurePosixPath
     move_dst_fid: int | None = None
 
 
-def make_file_info(
+def make_file_info(  # ruff: ignore[too-many-arguments]
+    *,
     file_id: int | None,
     uid: int | None,
     rel_path: str | None,
@@ -36,18 +47,30 @@ def make_file_info(
     sha256: str | None,
     move_dst_fid: int | None = None,
 ) -> SyncFileInfo | None:
+    """Convert nullable database fields into a file record.
+
+    Returns:
+        The file record, or `None` if `file_id` is `None`.
+
+    Raises:
+        ValueError: If an existing file lacks required metadata.
+
+    """
+    # An absent outer-join match produces NULL fields rather than a file record.
     if file_id is None:
         return None
 
+    # Once the ID exists, all required metadata must be present as well.
     if (
-        uid is None
+        uid is None  # ruff: ignore[too-many-boolean-expressions]
         or rel_path is None
         or mtime is None
         or size is None
         or md5 is None
         or sha256 is None
     ):
-        raise ValueError(f"Incomplete file information for ID {file_id}")
+        msg = f"Incomplete file information for ID {file_id}"
+        raise ValueError(msg)
 
     return SyncFileInfo(
         id=file_id,
@@ -62,6 +85,8 @@ def make_file_info(
 
 
 class SyncFileStatus(IntEnum):
+    """File presence and content differences between source and destination."""
+
     UNKNOWN = 0
     APPEARED = 1
     DISAPPEARED = 2
@@ -70,6 +95,8 @@ class SyncFileStatus(IntEnum):
 
 
 class SyncStrategy(IntEnum):
+    """Actions used to make destination files match the source."""
+
     UNDETERMINED = 0
     DO_NOTHING = 1
     IN_COPY = 2
@@ -79,6 +106,8 @@ class SyncStrategy(IntEnum):
 
 
 class SyncResultRow(NamedTuple):
+    """Planned action with source, destination, and optional local copy donor."""
+
     sync_status: SyncFileStatus
     sync_strategy: SyncStrategy
 
@@ -88,8 +117,15 @@ class SyncResultRow(NamedTuple):
 
 
 class SchizophreniaDBSync(SchizophreniaDBScan):
-    def sync_clear(self):
+    """Manage synchronization planning tables and operations.
+
+    Part of the database schema inheritance chain.
+    """
+
+    def sync_clear(self) -> None:
+        """Drop the previous synchronization view and planning table."""
         sqls = [
+            # Drop the dependent view before its backing table.
             "DROP VIEW IF EXISTS v_tmp_sync_calc",
             "DROP TABLE IF EXISTS tmp_sync_calc",
         ]
@@ -98,7 +134,9 @@ class SchizophreniaDBSync(SchizophreniaDBScan):
         log.info("Old sync tables removed.")
 
     def sync_create_table(self) -> None:
+        """Create the synchronization planning table and lookup indexes."""
         sqls = [
+            # Missing sides and unresolved strategies remain NULL during planning.
             """
             CREATE TABLE tmp_sync_calc
             (
@@ -112,6 +150,7 @@ class SchizophreniaDBSync(SchizophreniaDBScan):
                 move_dst_fid  INTEGER NULL
             )
             """,
+            # Support file matching and status-based updates of the plan.
             "CREATE INDEX index_sync_calc_a ON tmp_sync_calc (src_fid)",
             "CREATE INDEX index_sync_calc_b ON tmp_sync_calc (dst_fid)",
             "CREATE INDEX index_sync_calc_sync_status ON tmp_sync_calc (sync_status)",
@@ -121,6 +160,12 @@ class SchizophreniaDBSync(SchizophreniaDBScan):
         log.info("New sync tables created.")
 
     def sync_fill_table(self, src_storage_id: int, dst_storage_id: int) -> int:
+        """Populate the plan by matching source and destination relative paths.
+
+        Returns:
+            The cursor's row count, which may be `-1` for this CTE-based INSERT.
+
+        """
         sql = """
               WITH src AS (SELECT id, rel_path, uid
                            FROM file
@@ -136,14 +181,21 @@ class SchizophreniaDBSync(SchizophreniaDBScan):
               """
 
         log.debug(
-            f"Filling sync table for {src_storage_id} and {dst_storage_id} storages."
+            "Filling sync table for %s and %s storages.",
+            src_storage_id,
+            dst_storage_id,
         )
         cursor = self.conn.execute(sql, (src_storage_id, dst_storage_id))
-        log.info(f"Sync table filled with {cursor.rowcount} rows.")
+        log.info("Sync table filled with %s rows.", cursor.rowcount)
         return cursor.rowcount
 
     def sync_mark_sync_state(self) -> None:
+        """Classify `UNKNOWN` entries by file presence and content identity.
+
+        Assign `DO_NOTHING` to unchanged files and `UNDETERMINED` to the rest.
+        """
         # TODO: for
+        # Classify absent files first; UID comparisons apply to the remaining pairs.
         sql = """
               UPDATE tmp_sync_calc
               SET sync_status   = ?,
@@ -152,7 +204,7 @@ class SchizophreniaDBSync(SchizophreniaDBScan):
                 AND dst_fid IS NULL
               """
 
-        log.debug(f"Marking file sync state as {SyncFileStatus.APPEARED}.")
+        log.debug("Marking file sync state as %s.", SyncFileStatus.APPEARED)
         cursor = self.conn.execute(
             sql,
             (
@@ -161,7 +213,7 @@ class SchizophreniaDBSync(SchizophreniaDBScan):
                 SyncFileStatus.UNKNOWN,
             ),
         )
-        log.info(f"{cursor.rowcount} files marked as {SyncFileStatus.APPEARED}.")
+        log.info("%s files marked as %s.", cursor.rowcount, SyncFileStatus.APPEARED)
 
         sql = """
               UPDATE tmp_sync_calc
@@ -170,7 +222,7 @@ class SchizophreniaDBSync(SchizophreniaDBScan):
               WHERE sync_status = ?
                 AND src_fid IS NULL
               """
-        log.debug(f"Marking file sync state as {SyncFileStatus.DISAPPEARED}.")
+        log.debug("Marking file sync state as %s.", SyncFileStatus.DISAPPEARED)
         cursor = self.conn.execute(
             sql,
             (
@@ -179,7 +231,7 @@ class SchizophreniaDBSync(SchizophreniaDBScan):
                 SyncFileStatus.UNKNOWN,
             ),
         )
-        log.info(f"{cursor.rowcount} files marked as {SyncFileStatus.DISAPPEARED}.")
+        log.info("%s files marked as %s.", cursor.rowcount, SyncFileStatus.DISAPPEARED)
 
         sql = """
               UPDATE tmp_sync_calc
@@ -188,12 +240,12 @@ class SchizophreniaDBSync(SchizophreniaDBScan):
               WHERE sync_status = ?
                 AND src_uid != dst_uid
               """
-        log.debug(f"Marking file sync state as {SyncFileStatus.CHANGED}.")
+        log.debug("Marking file sync state as %s.", SyncFileStatus.CHANGED)
         cursor = self.conn.execute(
             sql,
             (SyncFileStatus.CHANGED, SyncStrategy.UNDETERMINED, SyncFileStatus.UNKNOWN),
         )
-        log.info(f"{cursor.rowcount} files marked as {SyncFileStatus.CHANGED}.")
+        log.info("%s files marked as %s.", cursor.rowcount, SyncFileStatus.CHANGED)
 
         sql = """
               UPDATE tmp_sync_calc
@@ -202,7 +254,7 @@ class SchizophreniaDBSync(SchizophreniaDBScan):
               WHERE sync_status = ?
                 AND src_uid = dst_uid
               """
-        log.debug(f"Marking file sync state as {SyncFileStatus.NOT_CHANGED}.")
+        log.debug("Marking file sync state as %s.", SyncFileStatus.NOT_CHANGED)
         cursor = self.conn.execute(
             sql,
             (
@@ -211,11 +263,17 @@ class SchizophreniaDBSync(SchizophreniaDBScan):
                 SyncFileStatus.UNKNOWN,
             ),
         )
-        log.info(f"{cursor.rowcount} files marked as {SyncFileStatus.NOT_CHANGED}.")
+        log.info("%s files marked as %s.", cursor.rowcount, SyncFileStatus.NOT_CHANGED)
 
         # TODO: check 0 count of SyncFileStatus.UNKNOWN
 
     def sync_find_strategy(self) -> None:
+        """Assign copy or delete strategies to unresolved entries.
+
+        Prefer `IN_COPY` when matching content exists in the destination;
+        otherwise use `OUT_COPY`. Assign `DELETE` to disappeared files.
+        """
+        # Reuse matching content already present anywhere in the destination.
         sql = """
               UPDATE tmp_sync_calc as copy_dst
               SET sync_strategy = ?,
@@ -224,7 +282,7 @@ class SchizophreniaDBSync(SchizophreniaDBScan):
                 AND copy_dst.sync_strategy = ?
                 AND copy_dst.src_uid = copy_src.dst_uid
               """
-        log.debug(f"Assigning strategy {SyncStrategy.IN_COPY}.")
+        log.debug("Assigning strategy %s.", SyncStrategy.IN_COPY)
         cursor = self.conn.execute(
             sql,
             (
@@ -235,16 +293,19 @@ class SchizophreniaDBSync(SchizophreniaDBScan):
             ),
         )
         log.info(
-            f"Strategy {SyncStrategy.IN_COPY} assigned to {cursor.rowcount} files."
+            "Strategy %s assigned to %s files.",
+            SyncStrategy.IN_COPY,
+            cursor.rowcount,
         )
 
+        # Files without a local content match must be copied from the source.
         sql = """
               UPDATE tmp_sync_calc
               SET sync_strategy = ?
               WHERE sync_status IN (?, ?)
                 AND sync_strategy = ?;
               """
-        log.debug(f"Assigning strategy {SyncStrategy.OUT_COPY}.")
+        log.debug("Assigning strategy %s.", SyncStrategy.OUT_COPY)
         cursor = self.conn.execute(
             sql,
             (
@@ -255,16 +316,19 @@ class SchizophreniaDBSync(SchizophreniaDBScan):
             ),
         )
         log.info(
-            f"Strategy {SyncStrategy.OUT_COPY} assigned to {cursor.rowcount} files."
+            "Strategy %s assigned to %s files.",
+            SyncStrategy.OUT_COPY,
+            cursor.rowcount,
         )
 
+        # Destination-only paths are no longer needed in the synchronized storage.
         sql = """
               UPDATE tmp_sync_calc
               SET sync_strategy = ?
               WHERE sync_status = ?
                 AND sync_strategy = ?;
               """
-        log.debug(f"Assigning strategy {SyncStrategy.DELETE}.")
+        log.debug("Assigning strategy %s.", SyncStrategy.DELETE)
         cursor = self.conn.execute(
             sql,
             (
@@ -273,10 +337,25 @@ class SchizophreniaDBSync(SchizophreniaDBScan):
                 SyncStrategy.UNDETERMINED,
             ),
         )
-        log.info(f"Strategy {SyncStrategy.DELETE} assigned to {cursor.rowcount} files.")
+        log.info(
+            "Strategy %s assigned to %s files.",
+            SyncStrategy.DELETE,
+            cursor.rowcount,
+        )
         # TODO: assert 0 UNDETERMINED left.
 
     def sync_iter_solving_move_strategy(self) -> int:
+        """Perform one pass replacing eligible local copies with moves.
+
+        Pair copy targets with destination files being removed or replaced,
+        recording `MOVE_TARGET` and the corresponding donor's target file ID.
+
+        Returns:
+            The number of planning rows updated, including both ends of each move.
+
+        """
+        # Select one target and one unclaimed donor per UID in each pass.
+        # Update both ends so a donor cannot be assigned to multiple move targets.
         sql = """
               UPDATE tmp_sync_calc
               SET sync_strategy = (CASE
@@ -294,15 +373,16 @@ class SchizophreniaDBSync(SchizophreniaDBScan):
                                            THEN sub.src_fid
                                        ELSE tmp_sync_calc.move_dst_fid
                       END
-                      ) FROM (
-                  SELECT max (move_dst.src_fid) AS src_fid, min (move_src.dst_fid) AS move_in_src_fid
-                  FROM tmp_sync_calc AS move_dst
-                  JOIN tmp_sync_calc AS move_src ON move_dst.src_uid = move_src.dst_uid
-                  WHERE move_dst.sync_strategy = ?
-                  AND move_src.sync_status IN (?, ?)
-                  AND move_src.move_dst_fid IS NULL
-                  GROUP BY move_dst.src_uid
-                  ) AS sub
+                      )
+              FROM (SELECT max(move_dst.src_fid) AS src_fid,
+                           min(move_src.dst_fid) AS move_in_src_fid
+                    FROM tmp_sync_calc AS move_dst
+                             JOIN tmp_sync_calc AS move_src
+                                  ON move_dst.src_uid = move_src.dst_uid
+                    WHERE move_dst.sync_strategy = ?
+                      AND move_src.sync_status IN (?, ?)
+                      AND move_src.move_dst_fid IS NULL
+                    GROUP BY move_dst.src_uid) AS sub
               WHERE tmp_sync_calc.src_fid = sub.src_fid
                  OR tmp_sync_calc.dst_fid = sub.move_in_src_fid
               """
@@ -317,10 +397,17 @@ class SchizophreniaDBSync(SchizophreniaDBScan):
                 SyncFileStatus.CHANGED,
             ),
         )
-        log.info(f"Found in_move solutions for {cursor.rowcount / 2} files.")
+        log.info("Found in_move solutions for %s files.", cursor.rowcount / 2)
         return cursor.rowcount
 
-    def sync_iter_entries(self) -> Iterator[SyncResultRow]:
+    def sync_iter_entries(self) -> Iterator[SyncResultRow]:  # ruff: ignore[too-many-locals]
+        """Iterate over planned actions with their associated file records.
+
+        Yields:
+            A plan entry with `None` for any absent source, destination, or donor.
+
+        """
+        # Keep every plan entry even when some associated files are absent.
         query = """
                 SELECT calc.sync_status,
                        calc.sync_strategy,
@@ -397,33 +484,33 @@ class SchizophreniaDBSync(SchizophreniaDBScan):
                 sync_status=SyncFileStatus(sync_status),
                 sync_strategy=SyncStrategy(row_sync_strategy),
                 src=make_file_info(
-                    src_id,
-                    src_uid,
-                    src_rel_path,
-                    src_mtime,
-                    src_size,
-                    src_md5,
-                    src_sha256,
-                    move_dst_fid,
+                    file_id=src_id,
+                    uid=src_uid,
+                    rel_path=src_rel_path,
+                    mtime=src_mtime,
+                    size=src_size,
+                    md5=src_md5,
+                    sha256=src_sha256,
+                    move_dst_fid=move_dst_fid,
                 ),
                 dst=make_file_info(
-                    dst_id,
-                    dst_uid,
-                    dst_rel_path,
-                    dst_mtime,
-                    dst_size,
-                    dst_md5,
-                    dst_sha256,
-                    move_dst_fid,
+                    file_id=dst_id,
+                    uid=dst_uid,
+                    rel_path=dst_rel_path,
+                    mtime=dst_mtime,
+                    size=dst_size,
+                    md5=dst_md5,
+                    sha256=dst_sha256,
+                    move_dst_fid=move_dst_fid,
                 ),
                 in_src=make_file_info(
-                    in_src_id,
-                    in_src_uid,
-                    in_src_rel_path,
-                    in_src_mtime,
-                    in_src_size,
-                    in_src_md5,
-                    in_src_sha256,
-                    move_dst_fid,
+                    file_id=in_src_id,
+                    uid=in_src_uid,
+                    rel_path=in_src_rel_path,
+                    mtime=in_src_mtime,
+                    size=in_src_size,
+                    md5=in_src_md5,
+                    sha256=in_src_sha256,
+                    move_dst_fid=move_dst_fid,
                 ),
             )
