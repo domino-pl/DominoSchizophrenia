@@ -355,50 +355,56 @@ class SchizophreniaDBSync(SchizophreniaDBScan):
 
         """
         # Select one target and one unclaimed donor per UID in each pass.
-        # Update both ends so a donor cannot be assigned to multiple move targets.
-        sql = """
+        # Freeze the pairs before updating either end. A row may be both a
+        # receiver and a donor, so resolve its two roles independently.
+        as_materialized = "AS MATERIALIZED"  # Trick PyCharm inspection
+        sql = f"""
+              WITH moves {as_materialized} (
+                  SELECT max(move_dst.src_fid) AS src_fid,
+                         min(move_src.dst_fid) AS move_in_src_fid
+                  FROM tmp_sync_calc AS move_dst
+                           JOIN tmp_sync_calc AS move_src
+                                ON move_dst.src_uid = move_src.dst_uid
+                  WHERE move_dst.sync_strategy = ?
+                    AND move_src.sync_status IN (?, ?)
+                    AND move_src.move_dst_fid IS NULL
+                  GROUP BY move_dst.src_uid
+              )
               UPDATE tmp_sync_calc
-              SET sync_strategy = (CASE
-                                       WHEN tmp_sync_calc.src_fid = sub.src_fid
-                                           THEN ?
-                                       ELSE tmp_sync_calc.sync_strategy
-                  END),
-                  in_src_fid    = (CASE
-                                       WHEN tmp_sync_calc.src_fid = sub.src_fid
-                                           THEN sub.move_in_src_fid
-                                       ELSE tmp_sync_calc.in_src_fid
-                      END),
-                  move_dst_fid  = (CASE
-                                       WHEN tmp_sync_calc.dst_fid = sub.move_in_src_fid
-                                           THEN sub.src_fid
-                                       ELSE tmp_sync_calc.move_dst_fid
-                      END
-                      )
-              FROM (SELECT max(move_dst.src_fid) AS src_fid,
-                           min(move_src.dst_fid) AS move_in_src_fid
-                    FROM tmp_sync_calc AS move_dst
-                             JOIN tmp_sync_calc AS move_src
-                                  ON move_dst.src_uid = move_src.dst_uid
-                    WHERE move_dst.sync_strategy = ?
-                      AND move_src.sync_status IN (?, ?)
-                      AND move_src.move_dst_fid IS NULL
-                    GROUP BY move_dst.src_uid) AS sub
-              WHERE tmp_sync_calc.src_fid = sub.src_fid
-                 OR tmp_sync_calc.dst_fid = sub.move_in_src_fid
-              """
+              SET sync_strategy = CASE
+                      WHEN EXISTS (SELECT 1 FROM moves
+                                   WHERE moves.src_fid = tmp_sync_calc.src_fid)
+                          THEN ?
+                      ELSE sync_strategy
+                  END,
+                  in_src_fid = coalesce(
+                      (SELECT move_in_src_fid FROM moves
+                       WHERE moves.src_fid = tmp_sync_calc.src_fid),
+                      in_src_fid),
+                  move_dst_fid = coalesce(
+                      (SELECT src_fid FROM moves
+                       WHERE moves.move_in_src_fid = tmp_sync_calc.dst_fid),
+                      move_dst_fid)
+              WHERE EXISTS (SELECT 1 FROM moves
+                            WHERE moves.src_fid = tmp_sync_calc.src_fid
+                               OR moves.move_in_src_fid = tmp_sync_calc.dst_fid)
+              RETURNING rowid
+              """  # ruff: ignore[hardcoded-sql-expression]
 
         log.debug("Iterating looking for move strategy solutions.")
         cursor = self.conn.execute(
             sql,
             (
-                SyncStrategy.MOVE_TARGET,
                 SyncStrategy.IN_COPY,
                 SyncFileStatus.DISAPPEARED,
                 SyncFileStatus.CHANGED,
+                SyncStrategy.MOVE_TARGET,
             ),
         )
-        log.info("Found in_move solutions for %s files.", cursor.rowcount / 2)
-        return cursor.rowcount
+        # CTE-based UPDATEs report rowcount=-1; count returned rows instead.
+        updated_rows = len(cursor.fetchall())
+        log.info("Updated %s planning rows for moves.", updated_rows)
+        return updated_rows
 
     def sync_iter_entries(self) -> Iterator[SyncResultRow]:  # ruff: ignore[too-many-locals]
         """Iterate over planned actions with their associated file records.
