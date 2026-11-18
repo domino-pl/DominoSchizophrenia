@@ -24,6 +24,9 @@ ignore = [
     "TD003", # missing-to-do-link
 ]
 
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"] # Allow assertions in tests.
+
 [tool.ty.environment]
 python-version = "3.14"
 
@@ -35,3 +38,8 @@ all = "error"
 
 [tool.ty.analysis]
 strict-literal-narrowing = true
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
