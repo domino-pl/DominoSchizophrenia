@@ -1,19 +1,25 @@
+# Copyright (c) 2026 Dominik Przybysz <dominik@przybysz.dev>
+
+"""Prepare, load, and execute synchronization plans across storage locations."""
+
 import csv
 import io
 import os
-from email.policy import default
 from enum import StrEnum
 from pathlib import Path, PurePath, PurePosixPath
-from typing import NamedTuple, Self, TypedDict, override
+from typing import TYPE_CHECKING, NamedTuple, Self, override
 
-from src.db import SchizophreniaDB
-from src.db.storage import Storage
-from src.db.sync import SyncFileInfo, SyncFileMeta, SyncFileStatus, SyncStrategy
+from src.db.sync import SyncFileInfo, SyncFileStatus, SyncStrategy
 from src.identity import Identity
 from src.tools import copy_with_hashes, format_mtime
 
+if TYPE_CHECKING:
+    from src.db import SchizophreniaDB
+
 
 class SyncFSActionPriority(StrEnum):
+    """Define action kinds and their execution order."""
+
     OUT_CP2_VIA = "out_cp2_via"
     VIA_CP2_LWD = "via_cp2_lwd"
     IN_CP2_LWD = "in_cp2_lwd"
@@ -33,6 +39,8 @@ class SyncFSActionPriority(StrEnum):
 
 
 class SyncStorageType(StrEnum):
+    """Identify the source, destination, and staging locations."""
+
     SRC = "src"
     DST = "dst"
     VIA = "via"
@@ -44,6 +52,8 @@ class SyncStorageType(StrEnum):
 
 
 class SyncStoragesType(NamedTuple):
+    """Store the identity, path, and availability of a plan location."""
+
     identity: Identity
     path: Path
     available: bool
@@ -53,6 +63,8 @@ SyncStorages = dict[SyncStorageType, SyncStoragesType]
 
 
 class SyncFSActionRow(NamedTuple):
+    """Represent the CSV fields of a synchronization action."""
+
     operation_id: str
     priority_value: str
     src_storage_value: str
@@ -68,7 +80,76 @@ class SyncFSActionRow(NamedTuple):
     move_dst_fid: str
 
 
+class SyncPlanError(ValueError):
+    """Report invalid synchronization plan or action-log data."""
+
+    ACTION_FIELD_LINE_BREAK = "An action field cannot contain a line break"
+    INVALID_ACTION_CSV = "Invalid action CSV"
+    INVALID_ACTION_COLUMNS = "An action line must contain exactly 13 fields"
+    INVALID_ACTION_PRIORITY = "Invalid action priority"
+    UNSUPPORTED_ACTION_PRIORITY = "Unsupported action priority: {}"
+    INVALID_ACTION_FIELD = "Invalid action field value"
+    WRONG_ACTION_TYPE = "Priority {} does not identify an action of type {}"
+    INVALID_STORAGE_CSV = "Invalid storage CSV at line {}"
+    INVALID_STORAGE_COLUMNS = "A storage line must contain exactly 2 fields (line {})"
+    INVALID_STORAGE_ENTRY = "Invalid storage entry at line {}"
+    DUPLICATE_STORAGE = "Duplicate storage: {}"
+    INVALID_ACTION = "Invalid action at line {}"
+    DUPLICATE_ACTION = "Duplicate action number: {}"
+    MISSING_STORAGE_IDENTITIES = "Missing storage identities: {}"
+    DATABASE_IDENTITY_MISMATCH = (
+        "Identity mismatch for {} storage: plan has {}, database has {}"
+    )
+    LOCATION_IDENTITY_MISMATCH = (
+        "Identity mismatch for {} storage at {}: plan has {}, location has {}"
+    )
+    INVALID_ACTION_LOG_CSV = "Invalid action log CSV at line {}"
+    INVALID_ACTION_LOG_COLUMNS = (
+        "An action log line must contain exactly 2 fields (line {})"
+    )
+    INVALID_ACTION_NUMBER = "Invalid action number at line {}"
+    INVALID_ACTION_STATUS = "Invalid action status at line {}"
+    UNKNOWN_ACTION_NUMBER = "Unknown action number {} at line {}"
+    MISSING_ACTION_LOG_SEPARATOR = "Missing {!r} separator in sync plan"
+
+
+class SyncConfigurationError(ValueError):
+    """Report a missing path required by a sync command."""
+
+    MISSING_VIA = "--via is required for {}"
+    MISSING_LWD = "--lwd is required for {}"
+
+
+class SyncValidationError(RuntimeError):
+    """Report a file or storage that fails action validation."""
+
+    MISSING_SOURCE_FIELDS = "Source src_storage_type or file_info is None"
+    UNAVAILABLE_SOURCE = "Source file not found"
+    ABSOLUTE_SOURCE_PATH = "Source file path is absolute"
+    UNEXPECTED_DESTINATION_FIELDS = "dst_storage_type or dst_rel_path is not None"
+    MISSING_DESTINATION_FIELDS = "dst_storage_type or dst_rel_path is None"
+    UNAVAILABLE_DESTINATION = "Destination file storage does not found"
+    MISSING_DESTINATION_IDENTITY = "Destination storage dispersed."
+    ABSOLUTE_DESTINATION_PATH = "Destination file path is absolute"
+
+
+class SyncExecutionError(RuntimeError):
+    """Report failures executing or preparing synchronization actions."""
+
+    MISSING_DESTINATION_PATH = "dst_path is None"
+    SIZE_MISMATCH = "Size error"
+    MD5_MISMATCH = "MD5 error"
+    SHA256_MISMATCH = "SHA256 error"
+    MISSING_SOURCE_ROW = "row.src is None"
+    UNKNOWN_STATUS = "Unknown sync_status: {}"
+    MISSING_SOURCE_OR_DONOR_ROW = "row.src or row.in_src is None"
+    UNKNOWN_STRATEGY = "Unknown strategy {}"
+
+
 class SyncFSBaseAction:
+    """Validate, serialize, and run an action on synchronized files."""
+
+    ACTION_LINE_COLUMNS = 13
     NEED_DST: bool
     PRIORITY: SyncFSActionPriority
 
@@ -78,13 +159,37 @@ class SyncFSBaseAction:
         src_file_info: SyncFileInfo,
         dst_storage_type: SyncStorageType | None,
         dst_rel_path: PurePath | None,
-    ):
+    ) -> None:
+        """Set the source and optional destination fields for the action."""
+        self._set_action_fields(
+            src_storage_type,
+            src_file_info,
+            dst_storage_type,
+            dst_rel_path,
+        )
+
+    def _set_action_fields(
+        self,
+        src_storage_type: SyncStorageType,
+        src_file_info: SyncFileInfo,
+        dst_storage_type: SyncStorageType | None,
+        dst_rel_path: PurePath | None,
+    ) -> None:
         self.src_storage_type = src_storage_type
         self.file_info = src_file_info
         self.dst_storage_type = dst_storage_type
         self.dst_rel_path = dst_rel_path
 
     def dump(self, operation_id: int) -> str:
+        """Serialize the action as a single CSV record.
+
+        Returns:
+            The CSV record without a line terminator.
+
+        Raises:
+            SyncPlanError: If any field contains a line break.
+
+        """
         fields = SyncFSActionRow(
             operation_id=str(operation_id),
             priority_value=self.PRIORITY.value,
@@ -110,28 +215,37 @@ class SyncFSBaseAction:
         )
 
         if any("\n" in field or "\r" in field for field in fields):
-            raise ValueError("An action field cannot contain a line break")
+            raise SyncPlanError(SyncPlanError.ACTION_FIELD_LINE_BREAK)
 
         output = io.StringIO()
         csv.writer(output, lineterminator="").writerow(fields)
         return output.getvalue()
 
-    @staticmethod
-    def load_str(line: str) -> tuple[int, "SyncFSBaseAction"]:
+    @classmethod
+    def load_str(cls, line: str) -> tuple[int, SyncFSBaseAction]:
+        """Decode one CSV record and select its concrete action type.
+
+        Returns:
+            The operation ID and reconstructed action.
+
+        Raises:
+            SyncPlanError: If the record cannot identify a valid action.
+
+        """
         try:
             rows = list(csv.reader([line], strict=True))
         except csv.Error as error:
-            raise ValueError("Invalid action CSV") from error
+            raise SyncPlanError(SyncPlanError.INVALID_ACTION_CSV) from error
 
-        if len(rows) != 1 or len(rows[0]) != 13:
-            raise ValueError("An action line must contain exactly 13 fields")
+        if len(rows) != 1 or len(rows[0]) != cls.ACTION_LINE_COLUMNS:
+            raise SyncPlanError(SyncPlanError.INVALID_ACTION_COLUMNS)
 
         row = SyncFSActionRow(*rows[0])
 
         try:
             priority = SyncFSActionPriority(row.priority_value)
         except ValueError as error:
-            raise ValueError("Invalid action priority") from error
+            raise SyncPlanError(SyncPlanError.INVALID_ACTION_PRIORITY) from error
 
         pending = list(SyncFSBaseAction.__subclasses__())
         while pending:
@@ -140,17 +254,26 @@ class SyncFSBaseAction:
             if action_type.__dict__.get("PRIORITY") == priority:
                 return action_type.load_typed_str(row)
 
-        raise ValueError(f"Unsupported action priority: {priority}")
+        raise SyncPlanError(SyncPlanError.UNSUPPORTED_ACTION_PRIORITY.format(priority))
 
     @classmethod
     def load_typed_str(cls, row: SyncFSActionRow) -> tuple[int, Self]:
+        """Reconstruct an action of this type from parsed fields.
+
+        Returns:
+            The operation ID and reconstructed action.
+
+        Raises:
+            SyncPlanError: If a field is invalid or the priority does not match.
+
+        """
         try:
             operation_id = int(row.operation_id)
             priority = SyncFSActionPriority(row.priority_value)
             src_storage_type = SyncStorageType(row.src_storage_value)
             dst_storage_type = (
                 None
-                if row.dst_storage_value == ""
+                if not row.dst_storage_value
                 else SyncStorageType(row.dst_storage_value)
             )
             file_info = SyncFileInfo(
@@ -161,77 +284,110 @@ class SyncFSBaseAction:
                 size=int(row.size),
                 md5=row.md5,
                 sha256=row.sha256,
-                move_dst_fid=(
-                    None if row.move_dst_fid == "" else int(row.move_dst_fid)
-                ),
+                move_dst_fid=(None if not row.move_dst_fid else int(row.move_dst_fid)),
             )
         except (TypeError, ValueError) as error:
-            raise ValueError("Invalid action field value") from error
+            raise SyncPlanError(SyncPlanError.INVALID_ACTION_FIELD) from error
 
         if priority != cls.PRIORITY:
-            raise ValueError(
-                f"Priority {priority} does not identify an action of type {cls.__name__}"
+            raise SyncPlanError(
+                SyncPlanError.WRONG_ACTION_TYPE.format(
+                    priority,
+                    cls.__name__,
+                ),
             )
 
         action = cls.__new__(cls)
-        SyncFSBaseAction.__init__(
+        cls._set_action_fields(
             action,
             src_storage_type,
             file_info,
             dst_storage_type,
-            None if row.dst_rel_path == "" else PurePosixPath(row.dst_rel_path),
+            None if not row.dst_rel_path else PurePosixPath(row.dst_rel_path),
         )
         return operation_id, action
 
     def execute(self, src_path: Path, dst_path: Path | None) -> None:
-        raise NotImplementedError()
+        """Apply the filesystem operation for this action.
+
+        Raises:
+            NotImplementedError: If the action type has no implementation.
+
+        """
+        raise NotImplementedError
 
     def validate_source(self, storages: SyncStorages) -> Path:
+        """Check source availability, path, and file metadata.
+
+        Returns:
+            The validated source file path.
+
+        Raises:
+            SyncValidationError: If source validation fails.
+            FileNotFoundError: If the source file does not exist.
+
+        """
         if self.src_storage_type is None or self.file_info is None:
-            raise Exception("Source src_storage_type or file_info is None")
+            raise SyncValidationError(SyncValidationError.MISSING_SOURCE_FIELDS)
 
         storage = storages.get(self.src_storage_type)
         if storage is None or not storage.available:
-            raise Exception("Source file not found")
+            raise SyncValidationError(SyncValidationError.UNAVAILABLE_SOURCE)
 
         if self.file_info.rel_path.is_absolute():
-            raise Exception("Source file path is absolute")
+            raise SyncValidationError(SyncValidationError.ABSOLUTE_SOURCE_PATH)
 
         src_file = storage.path / self.file_info.rel_path
 
         if not src_file.exists():
             raise FileNotFoundError(src_file)
         if not src_file.is_file():
-            raise Exception(src_file)  # TODO: ex
+            raise SyncValidationError(src_file)
 
-        stat = os.stat(src_file)
-        if format_mtime(stat) != self.file_info.mtime:
-            print(f"Bad mtime for {src_file} - wanted {format_mtime(stat)} - got {self.file_info.mtime}.")
-            if(input() != 'y'):
-                raise Exception(src_file)  # TODO: ex
-        if stat.st_size != self.file_info.size:
-            raise Exception(src_file)  # TODO: ex
+        file_stat = src_file.stat()
+        mtime = format_mtime(file_stat)
+        if mtime != self.file_info.mtime:
+            prompt = (
+                f"Bad mtime for {src_file} - wanted {mtime} "
+                f"- got {self.file_info.mtime}.\n"
+            )
+            if input(prompt) != "y":  # TODO
+                raise SyncValidationError(src_file)
+        if file_stat.st_size != self.file_info.size:
+            raise SyncValidationError(src_file)
 
         return src_file
 
     def validate_destination(self, storages: SyncStorages) -> Path | None:
+        """Check the destination path and storage identity.
+
+        Returns:
+            The destination path, or None if the action needs no destination.
+
+        Raises:
+            SyncValidationError: If destination validation fails.
+            FileExistsError: If the destination file already exists.
+
+        """
         if not self.NEED_DST:
             if self.dst_storage_type is not None or self.dst_rel_path is not None:
-                raise Exception("dst_storage_type or dst_rel_path is not None")
+                raise SyncValidationError(
+                    SyncValidationError.UNEXPECTED_DESTINATION_FIELDS,
+                )
             return None
 
         if self.dst_storage_type is None or self.dst_rel_path is None:
-            raise Exception("dst_storage_type or dst_rel_path is None")
+            raise SyncValidationError(SyncValidationError.MISSING_DESTINATION_FIELDS)
 
         storage = storages.get(self.dst_storage_type)
         if storage is None or not storage.available:
-            raise Exception("Destination file storage does not found")
+            raise SyncValidationError(SyncValidationError.UNAVAILABLE_DESTINATION)
 
         if not Identity.get_real_path(storage_path=storage.path).exists():
-            raise Exception("Destination storage dispersed.")
+            raise SyncValidationError(SyncValidationError.MISSING_DESTINATION_IDENTITY)
 
         if self.dst_rel_path.is_absolute():
-            raise Exception("Destination file path is absolute")
+            raise SyncValidationError(SyncValidationError.ABSOLUTE_DESTINATION_PATH)
 
         dst_file = storage.path / self.dst_rel_path
 
@@ -240,44 +396,51 @@ class SyncFSBaseAction:
 
         return dst_file
 
-    def run(self, storages: SyncStorages):
+    def run(self, storages: SyncStorages) -> None:
+        """Validate the paths and execute the action."""
         src_path = self.validate_source(storages)
         dst_path = self.validate_destination(storages)
         self.execute(src_path, dst_path)
 
 
 class SyncFsActionCopy(SyncFSBaseAction):
+    """Copy a file and verify the size and hashes of the copy."""
+
     NEED_DST = True
 
     @override
     def execute(self, src_path: Path, dst_path: Path | None) -> None:
         if dst_path is None:
-            raise RuntimeError("dst_path is None")
+            raise SyncExecutionError(SyncExecutionError.MISSING_DESTINATION_PATH)
 
         dst_path.parent.mkdir(parents=True, exist_ok=True)
         copy_result = copy_with_hashes(src_path, dst_path, preserve_mtime=True)
 
         if copy_result.size != self.file_info.size:
-            raise Exception("Size error")
+            raise SyncExecutionError(SyncExecutionError.SIZE_MISMATCH)
         if copy_result.md5 != self.file_info.md5:
-            raise Exception("MD5 error")
+            raise SyncExecutionError(SyncExecutionError.MD5_MISMATCH)
         if copy_result.sha256 != self.file_info.sha256:
-            raise Exception("SHA256 error")
+            raise SyncExecutionError(SyncExecutionError.SHA256_MISMATCH)
 
 
 class SyncFsActionMove(SyncFSBaseAction):
+    """Move a file to its planned destination."""
+
     NEED_DST = True
 
     @override
     def execute(self, src_path: Path, dst_path: Path | None) -> None:
         if dst_path is None:
-            raise RuntimeError("dst_path is None")
+            raise SyncExecutionError(SyncExecutionError.MISSING_DESTINATION_PATH)
 
         dst_path.parent.mkdir(parents=True, exist_ok=True)
         src_path.move(dst_path)
 
 
 class SyncFsActionRemove(SyncFSBaseAction):
+    """Delete a file from a staging directory."""
+
     NEED_DST = False
 
     @override
@@ -286,9 +449,12 @@ class SyncFsActionRemove(SyncFSBaseAction):
 
 
 class SyncActionOutCopy2Via(SyncFsActionCopy):
+    """Copy a source file to the transfer storage."""
+
     PRIORITY = SyncFSActionPriority.OUT_CP2_VIA
 
-    def __init__(self, src_file_info: SyncFileInfo):
+    def __init__(self, src_file_info: SyncFileInfo) -> None:
+        """Build the action for the supplied file metadata."""
         super().__init__(
             SyncStorageType.SRC,
             src_file_info,
@@ -298,9 +464,12 @@ class SyncActionOutCopy2Via(SyncFsActionCopy):
 
 
 class SyncFSActionViaCopy2LWD(SyncFsActionCopy):
+    """Copy a transferred source file to outgoing staging."""
+
     PRIORITY = SyncFSActionPriority.VIA_CP2_LWD
 
-    def __init__(self, src_file_info: SyncFileInfo):
+    def __init__(self, src_file_info: SyncFileInfo) -> None:
+        """Build the action for the supplied file metadata."""
         super().__init__(
             SyncStorageType.VIA,
             src_file_info,
@@ -310,11 +479,16 @@ class SyncFSActionViaCopy2LWD(SyncFsActionCopy):
 
 
 class SyncFSActionInCopy2LWD(SyncFsActionCopy):
+    """Copy an existing destination file to incoming staging."""
+
     PRIORITY = SyncFSActionPriority.IN_CP2_LWD
 
     def __init__(
-        self, src_file_info: SyncFileInfo, new_rel_path: PurePosixPath
-    ):
+        self,
+        src_file_info: SyncFileInfo,
+        new_rel_path: PurePosixPath,
+    ) -> None:
+        """Build the action with an explicit destination-relative path."""
         super().__init__(
             SyncStorageType.DST,
             src_file_info,
@@ -324,9 +498,12 @@ class SyncFSActionInCopy2LWD(SyncFsActionCopy):
 
 
 class SyncFSActionChangedMV2LWD(SyncFsActionMove):
+    """Move a changed destination file to changed staging."""
+
     PRIORITY = SyncFSActionPriority.CHANGED_MV2_LWD
 
-    def __init__(self, src_file_info: SyncFileInfo):
+    def __init__(self, src_file_info: SyncFileInfo) -> None:
+        """Build the action for the supplied file metadata."""
         super().__init__(
             SyncStorageType.DST,
             src_file_info,
@@ -336,9 +513,12 @@ class SyncFSActionChangedMV2LWD(SyncFsActionMove):
 
 
 class SyncFSActionDeletedMV2LWD(SyncFsActionMove):
+    """Move an obsolete destination file to deleted staging."""
+
     PRIORITY = SyncFSActionPriority.DELETED_MV2_LWD
 
-    def __init__(self, src_file_info: SyncFileInfo):
+    def __init__(self, src_file_info: SyncFileInfo) -> None:
+        """Build the action for the supplied file metadata."""
         super().__init__(
             SyncStorageType.DST,
             src_file_info,
@@ -348,11 +528,16 @@ class SyncFSActionDeletedMV2LWD(SyncFsActionMove):
 
 
 class SyncFSActionMovedMV2LWD(SyncFsActionMove):
+    """Move a reusable destination file to move staging."""
+
     PRIORITY = SyncFSActionPriority.MOVED_MV2_LWD
 
     def __init__(
-        self, src_file_info: SyncFileInfo, new_rel_path: PurePosixPath
-    ):
+        self,
+        src_file_info: SyncFileInfo,
+        new_rel_path: PurePosixPath,
+    ) -> None:
+        """Build the action with an explicit destination-relative path."""
         super().__init__(
             SyncStorageType.DST,
             src_file_info,
@@ -362,9 +547,12 @@ class SyncFSActionMovedMV2LWD(SyncFsActionMove):
 
 
 class SyncFSActionMovedMV2Dst(SyncFsActionMove):
+    """Move a staged reusable file to its final destination."""
+
     PRIORITY = SyncFSActionPriority.MOVED_MV2_DST
 
-    def __init__(self, src_file_info: SyncFileInfo):
+    def __init__(self, src_file_info: SyncFileInfo) -> None:
+        """Build the action for the supplied file metadata."""
         super().__init__(
             SyncStorageType.LWD_MOVED,
             src_file_info,
@@ -374,9 +562,12 @@ class SyncFSActionMovedMV2Dst(SyncFsActionMove):
 
 
 class SyncFSActionInMV2Dst(SyncFsActionMove):
+    """Move an incoming staged copy to its final destination."""
+
     PRIORITY = SyncFSActionPriority.IN_MV2_DST
 
-    def __init__(self, src_file_info: SyncFileInfo):
+    def __init__(self, src_file_info: SyncFileInfo) -> None:
+        """Build the action for the supplied file metadata."""
         super().__init__(
             SyncStorageType.LWD_IN_COPY,
             src_file_info,
@@ -386,9 +577,12 @@ class SyncFSActionInMV2Dst(SyncFsActionMove):
 
 
 class SyncFSActionOutMV2Dst(SyncFsActionMove):
+    """Move an outgoing staged copy to its final destination."""
+
     PRIORITY = SyncFSActionPriority.OUT_MV2_DST
 
-    def __init__(self, src_file_info: SyncFileInfo):
+    def __init__(self, src_file_info: SyncFileInfo) -> None:
+        """Build the action for the supplied file metadata."""
         super().__init__(
             SyncStorageType.LWD_OUT_COPY,
             src_file_info,
@@ -398,9 +592,12 @@ class SyncFSActionOutMV2Dst(SyncFsActionMove):
 
 
 class SyncFSActionRemoveDeleted(SyncFsActionRemove):
+    """Remove a file from deleted staging."""
+
     PRIORITY = SyncFSActionPriority.DELETED_RM
 
-    def __init__(self, src_file_info: SyncFileInfo):
+    def __init__(self, src_file_info: SyncFileInfo) -> None:
+        """Build the action for the supplied file metadata."""
         super().__init__(
             SyncStorageType.LWD_DELETED,
             src_file_info,
@@ -410,9 +607,12 @@ class SyncFSActionRemoveDeleted(SyncFsActionRemove):
 
 
 class SyncFSActionRemoveChanged(SyncFsActionRemove):
+    """Remove a file from changed staging."""
+
     PRIORITY = SyncFSActionPriority.CHANGED_RM
 
-    def __init__(self, src_file_info: SyncFileInfo):
+    def __init__(self, src_file_info: SyncFileInfo) -> None:
+        """Build the action for the supplied file metadata."""
         super().__init__(
             SyncStorageType.LWD_CHANGED,
             src_file_info,
@@ -422,9 +622,13 @@ class SyncFSActionRemoveChanged(SyncFsActionRemove):
 
 
 class SyncTask:
+    """Prepare a sync plan and run it across the transfer and local stages."""
+
+    STORAGE_LINE_COLUMNS = 2
+    ACTION_LINE_COLUMNS = 2
     ACTION_LOG_SEPARATOR = "--- actionlog ---"
 
-    def __init__(
+    def __init__(  # ruff: ignore[too-many-arguments, too-many-positional-arguments]
         self,
         db: SchizophreniaDB,
         src_storage_name: str,
@@ -433,6 +637,13 @@ class SyncTask:
         via: Path | None = None,
         lwd: Path | None = None,
     ) -> None:
+        """Bind the plan to its database storages and optional staging paths.
+
+        Raises:
+            FileNotFoundError: If a staging path does not exist.
+            NotADirectoryError: If a staging path is not a directory.
+
+        """
         self.db = db
         self.src_storage = self.db.select_storage(src_storage_name)
         self.dst_storage = self.db.select_storage(dst_storage_name)
@@ -450,6 +661,12 @@ class SyncTask:
             raise NotADirectoryError(self.lwd)
 
     def storage_type_to_path(self, storage_type: SyncStorageType) -> Path | None:
+        """Resolve the configured path for a storage type.
+
+        Returns:
+            The storage path, or None if the location is unconfigured.
+
+        """
         match storage_type:
             case SyncStorageType.SRC:
                 return self.src_storage.abs_path
@@ -468,43 +685,62 @@ class SyncTask:
                     return None
                 return self.lwd / storage_type.value
 
-    def load_sync_plan(
+    def load_sync_plan(  # ruff: ignore[complex-structure, too-many-branches]
         self,
     ) -> tuple[
         SyncStorages,
         dict[int, SyncFSBaseAction],
     ]:
+        """Read the plan and validate the configured storage identities.
+
+        Returns:
+            The storage locations and actions indexed by operation ID.
+
+        Raises:
+            SyncPlanError: If the plan is invalid or a storage identity differs.
+
+        """
         storage_identities: dict[SyncStorageType, Identity] = {}
         actions: dict[int, SyncFSBaseAction] = {}
 
         with self.sync_plan_file.open("r", encoding="utf-8", newline="") as plan_file:
-            for line_number, line in enumerate(plan_file, start=1):
-                line = line.rstrip("\r\n")
+            for line_number, line_raw in enumerate(plan_file, start=1):
+                line = line_raw.rstrip("\r\n")
 
                 if line_number <= len(SyncStorageType):
+                    # noinspection DuplicatedCode
                     try:
                         rows = list(csv.reader([line], strict=True))
                     except csv.Error as error:
-                        raise ValueError(
-                            f"Invalid storage CSV at line {line_number}"
+                        raise SyncPlanError(
+                            SyncPlanError.INVALID_STORAGE_CSV.format(
+                                line_number,
+                            ),
                         ) from error
 
-                    if len(rows) != 1 or len(rows[0]) != 2:
-                        raise ValueError(
-                            f"A storage line must contain exactly 2 fields "
-                            f"(line {line_number})"
+                    if len(rows) != 1 or len(rows[0]) != self.STORAGE_LINE_COLUMNS:
+                        raise SyncPlanError(
+                            SyncPlanError.INVALID_STORAGE_COLUMNS.format(
+                                line_number,
+                            ),
                         )
 
                     try:
                         storage_type = SyncStorageType(rows[0][0])
                         identity = Identity(rows[0][1])
                     except (TypeError, ValueError) as error:
-                        raise ValueError(
-                            f"Invalid storage entry at line {line_number}"
+                        raise SyncPlanError(
+                            SyncPlanError.INVALID_STORAGE_ENTRY.format(
+                                line_number,
+                            ),
                         ) from error
 
                     if storage_type in storage_identities:
-                        raise ValueError(f"Duplicate storage: {storage_type.value}")
+                        raise SyncPlanError(
+                            SyncPlanError.DUPLICATE_STORAGE.format(
+                                storage_type.value,
+                            ),
+                        )
                     storage_identities[storage_type] = identity
                     continue
 
@@ -514,10 +750,18 @@ class SyncTask:
                 try:
                     operation_id, action = SyncFSBaseAction.load_str(line)
                 except ValueError as error:
-                    raise ValueError(f"Invalid action at line {line_number}") from error
+                    raise SyncPlanError(
+                        SyncPlanError.INVALID_ACTION.format(
+                            line_number,
+                        ),
+                    ) from error
 
                 if operation_id in actions:
-                    raise ValueError(f"Duplicate action number: {operation_id}")
+                    raise SyncPlanError(
+                        SyncPlanError.DUPLICATE_ACTION.format(
+                            operation_id,
+                        ),
+                    )
                 actions[operation_id] = action
 
         missing_storages = set(SyncStorageType) - storage_identities.keys()
@@ -525,7 +769,11 @@ class SyncTask:
             missing_names = ", ".join(
                 storage_type.value for storage_type in missing_storages
             )
-            raise ValueError(f"Missing storage identities: {missing_names}")
+            raise SyncPlanError(
+                SyncPlanError.MISSING_STORAGE_IDENTITIES.format(
+                    missing_names,
+                ),
+            )
 
         database_identities = {
             SyncStorageType.SRC: self.src_storage.identity,
@@ -534,10 +782,12 @@ class SyncTask:
         for storage_type, database_identity in database_identities.items():
             plan_identity = storage_identities[storage_type]
             if plan_identity != database_identity:
-                raise ValueError(
-                    f"Identity mismatch for {storage_type.value} storage: "
-                    f"plan has {plan_identity.to_str()}, database has "
-                    f"{database_identity.to_str()}"
+                raise SyncPlanError(
+                    SyncPlanError.DATABASE_IDENTITY_MISMATCH.format(
+                        storage_type.value,
+                        plan_identity.to_str(),
+                        database_identity.to_str(),
+                    ),
                 )
 
         storages: SyncStorages = {}
@@ -550,11 +800,13 @@ class SyncTask:
                 if identity_file.exists():
                     actual_identity = Identity.read_from_storage_dir(storage_path)
                     if actual_identity != plan_identity:
-                        raise ValueError(
-                            f"Identity mismatch for {storage_type.value} storage "
-                            f"at {storage_path}: plan has "
-                            f"{plan_identity.to_str()}, location has "
-                            f"{actual_identity.to_str()}"
+                        raise SyncPlanError(
+                            SyncPlanError.LOCATION_IDENTITY_MISMATCH.format(
+                                storage_type.value,
+                                storage_path,
+                                plan_identity.to_str(),
+                                actual_identity.to_str(),
+                            ),
                         )
                     available = True
 
@@ -567,18 +819,39 @@ class SyncTask:
         return storages, actions
 
     def init_via(self) -> SyncStorages:
+        """Write the plan identity to the transfer storage.
+
+        Returns:
+            The plan storage locations with transfer storage marked available.
+
+        Raises:
+            SyncConfigurationError: If the transfer path is missing.
+
+        """
         via_path = self.storage_type_to_path(SyncStorageType.VIA)
         if via_path is None:
-            raise ValueError("--via is required for init_via")
+            raise SyncConfigurationError(
+                SyncConfigurationError.MISSING_VIA.format("init_via"),
+            )
 
         storages, _ = self.load_sync_plan()
         storages[SyncStorageType.VIA].identity.save_to_storage_dir(via_path)
         storages[SyncStorageType.VIA] = storages[SyncStorageType.VIA]._replace(
-            available=True
+            available=True,
         )
         return storages
 
     def init_lwd(self) -> SyncStorages:
+        """Create local staging directories and write their identities.
+
+        Returns:
+            The plan storage locations with local staging marked available.
+
+        Raises:
+            SyncConfigurationError: If the local staging path is missing.
+            FileExistsError: If a staging directory already has an identity.
+
+        """
         lwd_storage_types = tuple(
             storage_type
             for storage_type in SyncStorageType
@@ -588,7 +861,11 @@ class SyncTask:
         for storage_type in lwd_storage_types:
             storage_dir = self.storage_type_to_path(storage_type)
             if storage_dir is None:
-                raise ValueError("--lwd is required for init_lwd")
+                raise SyncConfigurationError(
+                    SyncConfigurationError.MISSING_LWD.format(
+                        "init_lwd",
+                    ),
+                )
             storage_dirs[storage_type] = storage_dir
 
         storages, _ = self.load_sync_plan()
@@ -605,66 +882,79 @@ class SyncTask:
 
         return storages
 
-    def _load_completed_action_ids(self, action_ids: set[int]) -> set[int]:
+    def _load_completed_action_ids(self, action_ids: set[int]) -> set[int]:  # ruff: ignore[complex-structure]
         completed_action_ids: set[int] = set()
         separator_found = False
 
         with self.sync_plan_file.open("r", encoding="utf-8", newline="") as plan_file:
-            for line_number, line in enumerate(plan_file, start=1):
-                line = line.rstrip("\r\n")
+            for line_number, line_raw in enumerate(plan_file, start=1):
+                line = line_raw.rstrip("\r\n")
                 if not separator_found:
                     if line == self.ACTION_LOG_SEPARATOR:
                         separator_found = True
                     continue
 
-                if line == "":
+                if not line:
                     continue
 
+                # noinspection DuplicatedCode
                 try:
                     rows = list(csv.reader([line], strict=True))
                 except csv.Error as error:
-                    raise ValueError(
-                        f"Invalid action log CSV at line {line_number}"
+                    raise SyncPlanError(
+                        SyncPlanError.INVALID_ACTION_LOG_CSV.format(
+                            line_number,
+                        ),
                     ) from error
 
-                if len(rows) != 1 or len(rows[0]) != 2:
-                    raise ValueError(
-                        f"An action log line must contain exactly 2 fields "
-                        f"(line {line_number})"
+                if len(rows) != 1 or len(rows[0]) != self.ACTION_LINE_COLUMNS:
+                    raise SyncPlanError(
+                        SyncPlanError.INVALID_ACTION_LOG_COLUMNS.format(
+                            line_number,
+                        ),
                     )
 
                 operation_id_value, status = rows[0]
                 try:
                     operation_id = int(operation_id_value)
                 except ValueError as error:
-                    raise ValueError(
-                        f"Invalid action number at line {line_number}"
+                    raise SyncPlanError(
+                        SyncPlanError.INVALID_ACTION_NUMBER.format(
+                            line_number,
+                        ),
                     ) from error
 
                 if status != "done":
-                    raise ValueError(f"Invalid action status at line {line_number}")
+                    raise SyncPlanError(
+                        SyncPlanError.INVALID_ACTION_STATUS.format(
+                            line_number,
+                        ),
+                    )
                 if operation_id not in action_ids:
-                    raise ValueError(
-                        f"Unknown action number {operation_id} at line {line_number}"
+                    raise SyncPlanError(
+                        SyncPlanError.UNKNOWN_ACTION_NUMBER.format(
+                            operation_id,
+                            line_number,
+                        ),
                     )
                 completed_action_ids.add(operation_id)
 
         if not separator_found:
-            raise ValueError(
-                f"Missing {self.ACTION_LOG_SEPARATOR!r} separator in sync plan"
+            raise SyncPlanError(
+                SyncPlanError.MISSING_ACTION_LOG_SEPARATOR.format(
+                    self.ACTION_LOG_SEPARATOR,
+                ),
             )
 
         return completed_action_ids
 
     def _append_completed_action(self, operation_id: int) -> None:
         with self.sync_plan_file.open("a", encoding="utf-8", newline="") as plan_file:
-            csv.writer(plan_file, lineterminator="\n").writerow(
-                (operation_id, "done")
-            )
+            csv.writer(plan_file, lineterminator="\n").writerow((operation_id, "done"))
             plan_file.flush()
             os.fsync(plan_file.fileno())
 
-    def _run_actions(self, run_via_stage: bool) -> None:
+    def _run_actions(self, *, run_via_stage: bool) -> None:
         storages, actions = self.load_sync_plan()
         completed_action_ids = self._load_completed_action_ids(set(actions))
 
@@ -680,16 +970,41 @@ class SyncTask:
             completed_action_ids.add(operation_id)
 
     def run_via(self) -> None:
+        """Run pending transfer actions and record their completion.
+
+        Raises:
+            SyncConfigurationError: If the transfer path is missing.
+
+        """
         if self.storage_type_to_path(SyncStorageType.VIA) is None:
-            raise ValueError("--via is required for run_via")
+            raise SyncConfigurationError(
+                SyncConfigurationError.MISSING_VIA.format("run_via"),
+            )
         self._run_actions(run_via_stage=True)
 
     def run_lwd(self) -> None:
+        """Run pending local staging actions and record their completion.
+
+        Raises:
+            SyncConfigurationError: If the local staging path is missing.
+
+        """
         if self.storage_type_to_path(SyncStorageType.LWD_IN_COPY) is None:
-            raise ValueError("--lwd is required for run_lwd")
+            raise SyncConfigurationError(
+                SyncConfigurationError.MISSING_LWD.format(
+                    "run_lwd",
+                ),
+            )
         self._run_actions(run_via_stage=False)
 
-    def prepare(self):
+    def prepare(self) -> None:  # ruff: ignore[complex-structure, too-many-branches, too-many-statements]
+        """Build and write a plan from the current source and destination scans.
+
+        Raises:
+            FileExistsError: If the plan file already exists.
+            SyncExecutionError: If a database row cannot produce a valid action.
+
+        """
         if self.sync_plan_file.exists():
             raise FileExistsError(self.sync_plan_file)
 
@@ -713,8 +1028,8 @@ class SyncTask:
             match row.sync_status:
                 case SyncFileStatus.CHANGED:
                     if dst is None:
-                        raise RuntimeError("row.src is None")
-                    if not dst.move_dst_fid:
+                        raise SyncExecutionError(SyncExecutionError.MISSING_SOURCE_ROW)
+                    if dst.move_dst_fid is not None:
                         operation_actions.extend((
                             SyncFSActionChangedMV2LWD(dst),
                             SyncFSActionRemoveChanged(dst),
@@ -726,14 +1041,18 @@ class SyncTask:
                 ):
                     pass
                 case _:
-                    raise RuntimeError(f"Unknown sync_status: {row.sync_status}")
+                    raise SyncExecutionError(
+                        SyncExecutionError.UNKNOWN_STATUS.format(
+                            row.sync_status,
+                        ),
+                    )
 
             match row.sync_strategy:
                 case SyncStrategy.DO_NOTHING:
                     pass
                 case SyncStrategy.OUT_COPY:
                     if src is None:
-                        raise RuntimeError("row.src is None")
+                        raise SyncExecutionError(SyncExecutionError.MISSING_SOURCE_ROW)
                     operation_actions.extend((
                         SyncActionOutCopy2Via(src),
                         SyncFSActionViaCopy2LWD(src),
@@ -741,32 +1060,40 @@ class SyncTask:
                     ))
                 case SyncStrategy.IN_COPY:
                     if src is None or in_src is None:
-                        raise RuntimeError("row.src or row.in_src is None")
+                        raise SyncExecutionError(
+                            SyncExecutionError.MISSING_SOURCE_OR_DONOR_ROW,
+                        )
                     operation_actions.extend((
                         SyncFSActionInCopy2LWD(in_src, src.rel_path),
                         SyncFSActionInMV2Dst(src),
                     ))
                 case SyncStrategy.MOVE_TARGET:
                     if src is None or in_src is None:
-                        raise RuntimeError("row.src or row.in_src is None")
+                        raise SyncExecutionError(
+                            SyncExecutionError.MISSING_SOURCE_OR_DONOR_ROW,
+                        )
                     operation_actions.extend((
                         SyncFSActionMovedMV2LWD(in_src, src.rel_path),
                         SyncFSActionMovedMV2Dst(src),
                     ))
                 case SyncStrategy.DELETE:
                     if dst is None:
-                        raise RuntimeError("row.src is None")
-                    if not dst.move_dst_fid:
+                        raise SyncExecutionError(SyncExecutionError.MISSING_SOURCE_ROW)
+                    if dst.move_dst_fid is not None:
                         operation_actions.extend((
                             SyncFSActionDeletedMV2LWD(dst),
                             SyncFSActionRemoveDeleted(dst),
                         ))
                 case _:
-                    raise RuntimeError(f"Unknown strategy {row.sync_strategy}")
+                    raise SyncExecutionError(
+                        SyncExecutionError.UNKNOWN_STRATEGY.format(
+                            row.sync_strategy,
+                        ),
+                    )
 
             actions.extend(operation_actions)
 
-        actions.sort(key=lambda action: action.PRIORITY.order)
+        actions.sort(key=lambda _action: _action.PRIORITY.order)
 
         storage_identities = {
             SyncStorageType.SRC: self.src_storage.identity,
