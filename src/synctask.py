@@ -1079,7 +1079,7 @@ class SyncTask:
                 case SyncStrategy.DELETE:
                     if dst is None:
                         raise SyncExecutionError(SyncExecutionError.MISSING_SOURCE_ROW)
-                    if dst.move_dst_fid is not None:
+                    if dst.move_dst_fid is None:
                         operation_actions.extend((
                             SyncFSActionDeletedMV2LWD(dst),
                             SyncFSActionRemoveDeleted(dst),
