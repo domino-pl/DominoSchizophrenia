@@ -265,8 +265,8 @@ class ScanTask:
     def _collect_sums(self) -> None:
         """Calculate pending MD5 and SHA-256 checksums after path matching.
 
-        Commit accumulated checksums periodically and after each selected batch,
-        then record and commit the CHECKSUM stage for that batch.
+        Commit accumulated checksums periodically and after each batch.
+        Record the CHECKSUM stage once no files remain to be hashed.
 
         Raises:
             InvalidScanStateError: If the latest scan is absent or not at MATCH.
@@ -328,8 +328,8 @@ class ScanTask:
             self.db.scan_update_scan_items_sum(new_sums)
             self.db.commit()
 
-            self.db.scan_update_step(scan.id, ScanStep.CHECKSUM)
-            self.db.commit()
+        self.db.scan_update_step(scan.id, ScanStep.CHECKSUM)
+        self.db.commit()
 
     def _compare(self) -> None:
         """Compare staged content with known files and commit COMPARE.
