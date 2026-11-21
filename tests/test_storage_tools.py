@@ -6,6 +6,7 @@ import errno
 import os
 import sqlite3
 from contextlib import contextmanager
+from pathlib import PureWindowsPath
 from shutil import SameFileError
 from typing import TYPE_CHECKING
 from unittest.mock import Mock
@@ -41,6 +42,23 @@ def test_storage_rejects_duplicate_path_or_identity(
     assert empty_db.select_storage("original") == original
     with pytest.raises(FetchEmptyError):
         empty_db.select_storage("second")
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        (PureWindowsPath(r"C:\data\storage"), "C:/data/storage"),
+        (PureWindowsPath(r"\\server\share\storage"), "//server/share/storage"),
+    ],
+)
+def test_storage_persists_windows_paths_with_posix_separators(
+    empty_db: SchizophreniaDB, path: PureWindowsPath, expected: str,
+) -> None:
+    """Store drives and network shares with forward slashes on every platform."""
+    empty_db.insert_storage("test", path, Identity.new())
+    assert empty_db.conn.execute("SELECT abs_path FROM storage").fetchall() == [
+        (expected,),
+    ]
 
 
 def test_identity_round_trip(tmp_path: Path) -> None:

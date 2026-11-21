@@ -7,7 +7,7 @@ import io
 import os
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from pathlib import Path, PurePath, PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, NamedTuple, Self, override
 
 from src.db.sync import SyncFileInfo, SyncFileStatus, SyncStrategy
@@ -169,7 +169,7 @@ class SyncFSBaseAction:
         src_storage_type: SyncStorageType,
         src_file_info: SyncFileInfo,
         dst_storage_type: SyncStorageType | None,
-        dst_rel_path: PurePath | None,
+        dst_rel_path: PurePosixPath | None,
     ) -> None:
         """Set the source and optional destination fields for the action."""
         self._set_action_fields(
@@ -184,7 +184,7 @@ class SyncFSBaseAction:
         src_storage_type: SyncStorageType,
         src_file_info: SyncFileInfo,
         dst_storage_type: SyncStorageType | None,
-        dst_rel_path: PurePath | None,
+        dst_rel_path: PurePosixPath | None,
     ) -> None:
         self.src_storage_type = src_storage_type
         self.file_info = src_file_info

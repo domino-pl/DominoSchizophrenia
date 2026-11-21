@@ -4,10 +4,13 @@
 
 import logging
 from pathlib import Path
-from typing import NamedTuple, override
+from typing import TYPE_CHECKING, NamedTuple, override
 
 from src.db.base import FetchEmptyError, SchizophreniaDBBase
 from src.identity import Identity
+
+if TYPE_CHECKING:
+    from pathlib import PurePath
 
 log = logging.getLogger(__name__)
 
@@ -68,7 +71,9 @@ class SchizophreniaDBStorage(SchizophreniaDBBase):
             identity=Identity.from_db(row[3]),
         )
 
-    def insert_storage(self, name: str, abs_path: Path, identity: Identity) -> Storage:
+    def insert_storage(
+        self, name: str, abs_path: PurePath, identity: Identity,
+    ) -> Storage:
         """Insert a storage configuration and return the new record.
 
         The caller is responsible for committing or rolling back the transaction.
@@ -78,7 +83,6 @@ class SchizophreniaDBStorage(SchizophreniaDBBase):
 
         """
         sql = "INSERT INTO storage(name, abs_path, identity) VALUES (?, ?, ?)"
-        # Serialize the path and identity into values supported by the database.
-        self.conn.execute(sql, (name, str(abs_path), identity.to_db()))
+        self.conn.execute(sql, (name, abs_path.as_posix(), identity.to_db()))
         # Read back the generated ID along with the stored configuration.
         return self.select_storage(name)
