@@ -284,8 +284,8 @@ class ScanTask:
 
         log.info("Start checksums calculation.")
         last_commit_time = datetime.now(tz=UTC)
-        new_sums: list[ScanItemCheckSums] = []
         while True:
+            new_sums: list[ScanItemCheckSums] = []
             files = self.db.scan_select_files_for_checksum_calculation(scan)
 
             if len(files) == 0:
