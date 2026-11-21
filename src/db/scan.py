@@ -289,6 +289,25 @@ class SchizophreniaDBScan(SchizophreniaDBFile):
         )
         log.debug("Found %s not modified files.", cursor.rowcount)
 
+    def scan_checksum_totals(self, scan: Scan) -> tuple[int, int]:
+        """Summarize the remaining checksum work.
+
+        Returns:
+            The number of pending files and their combined size in bytes.
+
+        """
+        count, size = self.conn.execute(
+            """
+            SELECT COUNT(*), COALESCE(SUM(size), 0)
+            FROM scan_item
+            WHERE scan_id = ?
+              AND status IN (?, ?)
+              AND (md5 IS NULL OR sha256 IS NULL)
+            """,
+            (scan.id, int(ScanFileStatus.NEW), int(ScanFileStatus.UNKNOWN)),
+        ).fetchone()
+        return int(count), int(size)
+
     def scan_select_files_for_checksum_calculation(
         self,
         scan: Scan,

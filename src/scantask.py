@@ -14,7 +14,13 @@ from typing import TYPE_CHECKING
 
 from src.db.scan import Scan, ScanItemCheckSums, ScanListItem, ScanStep
 from src.identity import IDENTITY_FILE_NAME
-from src.tools import format_mtime, format_size, raise_walk_error
+from src.tools import (
+    NO_PROGRESS,
+    FileProgress,
+    format_mtime,
+    format_size,
+    raise_walk_error,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -83,15 +89,19 @@ class ScanTask:
     CHUNK_SIZE = 1024 * 1024
     CHECKSUMS_COMMIT_INTERVAL_S = 60
 
-    def __init__(self, db: SchizophreniaDB, storage_name: str) -> None:
+    def __init__(
+        self, db: SchizophreniaDB, storage_name: str, *, progress: bool = False,
+    ) -> None:
         """Bind the task to a database and a registered storage.
 
         Args:
             db: Database used to read storage details and persist scan results.
             storage_name: Name of the registered storage to scan.
+            progress: Whether to report checksum progress.
 
         """
         self.db = db
+        self.show_progress = progress
         self.storage = self.db.select_storage(storage_name)
 
     def _find_last_storage_scan(self) -> Scan | None:
@@ -284,7 +294,6 @@ class ScanTask:
             ScanFileChangedError: If file metadata changed after listing.
 
         """
-        # TODO: Progress (per file and total)
         scan = self._find_last_storage_scan()
         expected_steps = (ScanStep.MATCH,)
         if scan is None or scan.finished_step not in expected_steps:
@@ -294,16 +303,17 @@ class ScanTask:
             )
 
         log.info("Start checksums calculation.")
+        progress = (
+            FileProgress(*self.db.scan_checksum_totals(scan))
+            if self.show_progress else NO_PROGRESS
+        )
         last_commit_time = datetime.now(tz=UTC)
-        while True:
+        while files := self.db.scan_select_files_for_checksum_calculation(scan):
             new_sums: list[ScanItemCheckSums] = []
-            files = self.db.scan_select_files_for_checksum_calculation(scan)
-
-            if len(files) == 0:
-                break
 
             for file_info in files:
                 log.debug("Calculating sums for '%s'.", file_info.rel_path)
+                progress.start_file(file_info.rel_path.as_posix(), file_info.size)
                 md5_hash = md5()  # ruff: ignore[hashlib-insecure-hash-function]
                 sha256_hash = sha256()
 
@@ -314,6 +324,7 @@ class ScanTask:
                     while chunk := file.read(self.CHUNK_SIZE):
                         md5_hash.update(chunk)
                         sha256_hash.update(chunk)
+                        progress.advance(len(chunk))
                     after = os.fstat(file.fileno())
 
                 if (
@@ -323,6 +334,8 @@ class ScanTask:
                     or after.st_mtime_ns != before.st_mtime_ns
                 ):
                     raise ScanFileChangedError(file_path)
+
+                progress.finish_file()
 
                 new_sums.append(
                     ScanItemCheckSums(

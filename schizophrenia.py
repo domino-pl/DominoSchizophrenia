@@ -5,7 +5,7 @@
 
 import logging
 import sys
-from argparse import ArgumentParser
+from argparse import SUPPRESS, ArgumentParser
 from enum import StrEnum
 from pathlib import Path
 
@@ -76,9 +76,15 @@ def add_storage(db: SchizophreniaDB, name: str, storage_abs_path: Path) -> None:
     log.info("Added storage %s with absolute path %s.", name, storage_abs_path)
 
 
-def scan(db: SchizophreniaDB, storage_name: str, action: ScanAction) -> None:
+def scan(
+    db: SchizophreniaDB,
+    storage_name: str,
+    action: ScanAction,
+    *,
+    progress: bool = False,
+) -> None:
     """Run the requested scan operation for a registered storage."""
-    scan_task = ScanTask(db, storage_name)
+    scan_task = ScanTask(db, storage_name, progress=progress)
 
     match action:
         case ScanAction.START:
@@ -98,10 +104,13 @@ def sync(  # ruff: ignore[too-many-arguments, too-many-positional-arguments]
     action: SyncAction,
     via: Path | None = None,
     lwd: Path | None = None,
+    *,
+    progress: bool = False,
 ) -> None:
     """Run the requested synchronization stage for two registered storages."""
     sync_task = SyncTask(
         db, src_storage_name, dst_storage_name, syncplan_file, via, lwd,
+        progress=progress,
     )
 
     match action:
@@ -125,6 +134,8 @@ def main() -> int:
 
     """
     parser = ArgumentParser()
+    progress_help = "Show checksum and copy progress."
+    parser.add_argument("-p", "--progress", action="store_true", help=progress_help)
     commands = parser.add_subparsers(
         dest="command",
         required=True,
@@ -145,6 +156,11 @@ def main() -> int:
     sync_parser.add_argument("syncplan_file", type=Path)
     sync_parser.add_argument("--via", type=Path)
     sync_parser.add_argument("--lwd", type=Path)
+    for command_parser in (scan_parser, sync_parser):
+        command_parser.add_argument(
+            "-p", "--progress", action="store_true", default=SUPPRESS,
+            help=progress_help,
+        )
 
     args = parser.parse_args()
     action = getattr(args, "action", None)
@@ -154,7 +170,7 @@ def main() -> int:
         if args.command == "add_storage":
             add_storage(db, args.storage_name, args.path.absolute())
         elif args.command == "scan" and isinstance(action, ScanAction):
-            scan(db, args.storage_name, action)
+            scan(db, args.storage_name, action, progress=args.progress)
         elif args.command == "sync" and isinstance(action, SyncAction):
             sync(
                 db,
@@ -164,6 +180,7 @@ def main() -> int:
                 action,
                 args.via.absolute() if args.via else None,
                 args.lwd.absolute() if args.lwd else None,
+                progress=args.progress,
             )
 
     finally:

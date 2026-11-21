@@ -12,7 +12,13 @@ from typing import TYPE_CHECKING, NamedTuple, Self, override
 
 from src.db.sync import SyncFileInfo, SyncFileStatus, SyncStrategy
 from src.identity import Identity
-from src.tools import copy_with_hashes, format_mtime
+from src.tools import (
+    NO_PROGRESS,
+    FileProgress,
+    Progress,
+    copy_with_hashes,
+    format_mtime,
+)
 
 if TYPE_CHECKING:
     from src.db import SchizophreniaDB
@@ -185,6 +191,7 @@ class SyncFSBaseAction:
         self.dst_storage_type = dst_storage_type
         self.dst_rel_path = dst_rel_path
         self.dst_mtime: str | None = None
+        self.progress: Progress = NO_PROGRESS
 
     def dump(self, operation_id: int) -> str:
         """Serialize the action as a single CSV record.
@@ -409,6 +416,14 @@ class SyncFSBaseAction:
         dst_path = self.validate_destination(storages)
         self.execute(src_path, dst_path)
 
+    def _report_completed_file(self) -> None:
+        """Report the full size of a completed move or removal."""
+        name = self.file_info.rel_path.as_posix()
+        size = self.file_info.size
+        self.progress.start_file(name, size)
+        self.progress.advance(size)
+        self.progress.finish_file()
+
     def _set_destination_mtime(self, path: Path) -> None:
         """Apply an explicitly planned destination timestamp."""
         if self.dst_mtime is None:
@@ -429,6 +444,9 @@ class SyncFsActionCopy(SyncFSBaseAction):
         if dst_path is None:
             raise SyncExecutionError(SyncExecutionError.MISSING_DESTINATION_PATH)
 
+        self.progress.start_file(
+            self.file_info.rel_path.as_posix(), self.file_info.size,
+        )
         dst_path.parent.mkdir(parents=True, exist_ok=True)
         # Claim the path before enabling cleanup for this copy attempt.
         dst_path.touch(exist_ok=False)
@@ -438,6 +456,7 @@ class SyncFsActionCopy(SyncFSBaseAction):
         except BaseException:
             dst_path.unlink(missing_ok=True)
             raise
+        self.progress.finish_file()
 
     def _copy_and_verify(self, src_path: Path, dst_path: Path) -> None:
         """Copy the file and check its size and hashes against the plan.
@@ -446,7 +465,12 @@ class SyncFsActionCopy(SyncFSBaseAction):
             SyncExecutionError: If the copied size or a hash differs from the plan.
 
         """
-        copy_result = copy_with_hashes(src_path, dst_path, preserve_mtime=True)
+        copy_result = copy_with_hashes(
+            src_path,
+            dst_path,
+            preserve_mtime=True,
+            on_chunk=self.progress.advance,
+        )
         if copy_result.size != self.file_info.size:
             raise SyncExecutionError(SyncExecutionError.SIZE_MISMATCH)
         if copy_result.md5 != self.file_info.md5:
@@ -472,6 +496,7 @@ class SyncFsActionMove(SyncFSBaseAction):
         except BaseException:
             dst_path.move(src_path)
             raise
+        self._report_completed_file()
 
 
 class SyncFsActionRemove(SyncFSBaseAction):
@@ -482,6 +507,7 @@ class SyncFsActionRemove(SyncFSBaseAction):
     @override
     def execute(self, src_path: Path, dst_path: Path | None) -> None:
         src_path.unlink()
+        self._report_completed_file()
 
 
 class SyncActionOutCopy2Via(SyncFsActionCopy):
@@ -676,6 +702,8 @@ class SyncTask:
         syncplan_file: Path,
         via: Path | None = None,
         lwd: Path | None = None,
+        *,
+        progress: bool = False,
     ) -> None:
         """Bind the plan to its database storages and optional staging paths.
 
@@ -685,6 +713,7 @@ class SyncTask:
 
         """
         self.db = db
+        self.show_progress = progress
         self.src_storage = self.db.select_storage(src_storage_name)
         self.dst_storage = self.db.select_storage(dst_storage_name)
         self.sync_plan_file = syncplan_file
@@ -998,6 +1027,7 @@ class SyncTask:
         storages, actions = self.load_sync_plan()
         completed_action_ids = self._load_completed_action_ids(set(actions))
 
+        pending: list[tuple[int, SyncFSBaseAction]] = []
         for operation_id, action in sorted(actions.items()):
             is_via_action = action.PRIORITY == SyncFSActionPriority.OUT_CP2_VIA
             if is_via_action != run_via_stage:
@@ -1005,9 +1035,18 @@ class SyncTask:
             if operation_id in completed_action_ids:
                 continue
 
+            pending.append((operation_id, action))
+
+        progress = NO_PROGRESS
+        if self.show_progress:
+            progress = FileProgress(
+                len(pending), sum(action.file_info.size for _, action in pending),
+            )
+
+        for operation_id, action in pending:
+            action.progress = progress
             action.run(storages)
             self._append_completed_action(operation_id)
-            completed_action_ids.add(operation_id)
 
     def run_via(self) -> None:
         """Run pending transfer actions and record their completion.
