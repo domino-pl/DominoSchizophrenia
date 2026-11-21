@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 from src.db.scan import Scan, ScanItemCheckSums, ScanListItem, ScanStep
 from src.identity import IDENTITY_FILE_NAME
-from src.tools import format_mtime, format_size
+from src.tools import format_mtime, format_size, raise_walk_error
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -156,6 +156,7 @@ class ScanTask:
         """Replace staged items with a file listing and commit the LIST stage.
 
         Store storage-relative paths, sizes, and modification times in batches.
+        Directory read errors interrupt listing and propagate to the caller.
 
         Raises:
             InvalidScanStateError: If the latest scan is absent or not at INSERT.
@@ -181,7 +182,7 @@ class ScanTask:
         new_items: list[ScanListItem] = []
         for current_dir, dirnames, filenames in self.storage.abs_path.walk(
             top_down=True,
-            on_error=None,
+            on_error=raise_walk_error,
             follow_symlinks=False,
         ):
             subdirs_to_skip = [

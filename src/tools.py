@@ -13,6 +13,11 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
+def raise_walk_error(error: OSError) -> None:
+    """Propagate a directory read error to stop walking the tree."""
+    raise error
+
+
 def format_size(size_bytes: int) -> str:
     """Format a byte count using binary units from B through PiB.
 
