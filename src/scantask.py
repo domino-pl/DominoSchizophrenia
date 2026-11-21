@@ -119,8 +119,8 @@ class ScanTask:
             )
 
         log.debug("Insert new scan")
-        self.db.scan_insert(self.storage.id)
-        self.db.commit()
+        with self.db.write_transaction():
+            self.db.scan_insert(self.storage.id)
         log.info("New scan inserted")
 
     @staticmethod
@@ -179,73 +179,70 @@ class ScanTask:
                 expected_steps=expected_steps,
             )
 
-        log.debug("Delete all scan items for storage %s.", self.storage.name)
-        self.db.scan_delete_all_storage_scan_items(self.storage.id)
+        with self.db.write_transaction():
+            self.db.scan_delete_all_storage_scan_items(self.storage.id)
+            log.info(
+                "Begin file listing for storage %s in '%s'.",
+                self.storage.name,
+                self.storage.abs_path,
+            )
+            new_items: list[ScanListItem] = []
+            for current_dir, dirnames, filenames in self.storage.abs_path.walk(
+                top_down=True,
+                on_error=raise_walk_error,
+                follow_symlinks=False,
+            ):
+                subdirs_to_skip = [
+                    subdir
+                    for subdir in dirnames
+                    if self._is_system_directory(current_dir / subdir)
+                ]
+                for subdir in subdirs_to_skip:
+                    log.info("Skipping SYSTEM directory %s.", current_dir / subdir)
+                    dirnames.remove(subdir)
 
-        log.info(
-            "Begin file listing for storage %s in '%s'.",
-            self.storage.name,
-            self.storage.abs_path,
-        )
-        new_items: list[ScanListItem] = []
-        for current_dir, dirnames, filenames in self.storage.abs_path.walk(
-            top_down=True,
-            on_error=raise_walk_error,
-            follow_symlinks=False,
-        ):
-            subdirs_to_skip = [
-                subdir
-                for subdir in dirnames
-                if self._is_system_directory(current_dir / subdir)
-            ]
-            for subdir in subdirs_to_skip:
-                log.info("Skipping SYSTEM directory %s.", current_dir / subdir)
-                dirnames.remove(subdir)
+                for file in filenames:
+                    # The root identity file describes the storage, not user data.
+                    if current_dir == self.storage.abs_path and file == IDENTITY_FILE_NAME:
+                        log.info(
+                            "Skipping identity file %s in %s.",
+                            IDENTITY_FILE_NAME,
+                            IDENTITY_FILE_NAME,
+                        )
+                        continue
 
-            for file in filenames:
-                # The root identity file describes the storage, not user data.
-                if current_dir == self.storage.abs_path and file == IDENTITY_FILE_NAME:
-                    log.info(
-                        "Skipping identity file %s in %s.",
-                        IDENTITY_FILE_NAME,
-                        IDENTITY_FILE_NAME,
-                    )
-                    continue
+                    file_path = current_dir / file
+                    if file_path.is_symlink() or not file_path.is_file():
+                        raise UnsupportedFileTypeError(file_path)
 
-                file_path = current_dir / file
-                if file_path.is_symlink() or not file_path.is_file():
-                    raise UnsupportedFileTypeError(file_path)
-
-                file_stat = file_path.stat()
-                new_items.append(
-                    ScanListItem(
-                        rel_path=PurePosixPath(
-                            file_path.relative_to(self.storage.abs_path).as_posix(),
+                    file_stat = file_path.stat()
+                    new_items.append(
+                        ScanListItem(
+                            rel_path=PurePosixPath(
+                                file_path.relative_to(self.storage.abs_path).as_posix(),
+                            ),
+                            size=file_stat.st_size,
+                            mtime=format_mtime(file_stat),
                         ),
-                        size=file_stat.st_size,
-                        mtime=format_mtime(file_stat),
-                    ),
-                )
+                    )
 
-                log.debug(
-                    "Found file '%s' (size=%s, mtime=%s).",
-                    new_items[-1].rel_path,
-                    format_size(new_items[-1].size),
-                    new_items[-1].mtime,
-                )
+                    log.debug(
+                        "Found file '%s' (size=%s, mtime=%s).",
+                        new_items[-1].rel_path,
+                        format_size(new_items[-1].size),
+                        new_items[-1].mtime,
+                    )
 
-                if len(new_items) > self.INSERT_SIZE:
-                    # Flush batches to keep the in-memory listing bounded.
-                    self.db.scan_insert_scan_items(scan, new_items)
-                    log.debug("Inserted %s new scan items.", len(new_items))
-                    new_items = []
+                    if len(new_items) > self.INSERT_SIZE:
+                        # Flush batches to keep the in-memory listing bounded.
+                        self.db.scan_insert_scan_items(scan, new_items)
+                        log.debug("Inserted %s new scan items.", len(new_items))
+                        new_items = []
 
-        self.db.scan_insert_scan_items(scan, new_items)
-        log.debug("Inserted %s new scan items.", len(new_items))
-
-        self.db.scan_update_step(scan.id, ScanStep.LIST)
+            self.db.scan_insert_scan_items(scan, new_items)
+            log.debug("Inserted %s new scan items.", len(new_items))
+            self.db.scan_update_step(scan.id, ScanStep.LIST)
         log.info("Finished file listing for scan.")
-        self.db.commit()
 
     def _match(self) -> None:
         """Match staged paths to known files and commit the MATCH stage.
@@ -266,10 +263,10 @@ class ScanTask:
             "Match new scan items with known files in storage %s.",
             self.storage.name,
         )
-        self.db.scan_match_files(scan)
-        self.db.scan_update_step(scan.id, ScanStep.MATCH)
+        with self.db.write_transaction():
+            self.db.scan_match_files(scan)
+            self.db.scan_update_step(scan.id, ScanStep.MATCH)
         log.info("Finished matching.")
-        self.db.commit()
 
     def _collect_sums(self) -> None:
         """Calculate pending MD5 and SHA-256 checksums after path matching.
@@ -340,16 +337,16 @@ class ScanTask:
                     seconds=self.CHECKSUMS_COMMIT_INTERVAL_S,
                 ):
                     # Persist progress during long checksum batches.
-                    self.db.scan_update_scan_items_sum(new_sums)
-                    self.db.commit()
+                    with self.db.write_transaction():
+                        self.db.scan_update_scan_items_sum(new_sums)
                     new_sums = []
                     last_commit_time = datetime.now(tz=UTC)
 
-            self.db.scan_update_scan_items_sum(new_sums)
-            self.db.commit()
+            with self.db.write_transaction():
+                self.db.scan_update_scan_items_sum(new_sums)
 
-        self.db.scan_update_step(scan.id, ScanStep.CHECKSUM)
-        self.db.commit()
+        with self.db.write_transaction():
+            self.db.scan_update_step(scan.id, ScanStep.CHECKSUM)
 
     def _compare(self) -> None:
         """Compare staged content with known files and commit COMPARE.
@@ -370,9 +367,9 @@ class ScanTask:
             "Compare new scan items content with known files in storage %s.",
             self.storage.name,
         )
-        self.db.scan_update_scan_items_content_changed(scan)
-        self.db.scan_update_step(scan.id, ScanStep.COMPARE)
-        self.db.commit()
+        with self.db.write_transaction():
+            self.db.scan_update_scan_items_content_changed(scan)
+            self.db.scan_update_step(scan.id, ScanStep.COMPARE)
         log.info("Finished comparing new scan items.")
 
     def _assign_uid(self) -> None:
@@ -391,9 +388,9 @@ class ScanTask:
             )
 
         # TODO: log
-        self.db.scan_assign_scan_new_uid(scan.id)
-        self.db.scan_update_step(scan.id, ScanStep.ASSIGN_UID)
-        self.db.commit()
+        with self.db.write_transaction():
+            self.db.scan_assign_scan_new_uid(scan.id)
+            self.db.scan_update_step(scan.id, ScanStep.ASSIGN_UID)
         log.info("Finished assigning UID.")
 
     def _start(self) -> None:
@@ -486,10 +483,10 @@ class ScanTask:
                 expected_steps=expected_steps,
             )
 
-        # Reconcile deletions, updates, and additions before marking completion.
-        self.db.scan_delete_file_records_scanned_as_deleted(scan.id)
-        self.db.scan_update_file_records_with_meta_changed(scan.id)
-        self.db.scan_update_file_records_with_content_changed(scan.id)
-        self.db.scan_insert_new_scanned_file_records(scan.id)
-        self.db.scan_update_step(scan.id, ScanStep.APPLY)
-        self.db.commit()
+        # Commit the index changes and scan checkpoint together.
+        with self.db.write_transaction():
+            self.db.scan_delete_file_records_scanned_as_deleted(scan.id)
+            self.db.scan_update_file_records_with_meta_changed(scan.id)
+            self.db.scan_update_file_records_with_content_changed(scan.id)
+            self.db.scan_insert_new_scanned_file_records(scan.id)
+            self.db.scan_update_step(scan.id, ScanStep.APPLY)

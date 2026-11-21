@@ -4,10 +4,11 @@
 
 import logging
 import sqlite3
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Generator, Iterable
 
 log = logging.getLogger(__name__)
 
@@ -32,7 +33,8 @@ class SchizophreniaDBBase:
         """Open the application database and run the initialization hook."""
         self.conn = sqlite3.connect("schizophrenia.db")
         try:
-            self._init_db()
+            with self.write_transaction():
+                self._init_db()
         except BaseException:
             self.conn.close()
             raise
@@ -48,6 +50,22 @@ class SchizophreniaDBBase:
         """Commit the current transaction and log the operation."""
         self.conn.commit()
         log.debug("Commiting changes.")
+
+    @contextmanager
+    def write_transaction(self) -> Generator[None]:
+        """Commit grouped writes or roll back the connection on failure.
+
+        Includes any pending writes on this connection. Use a single block per
+        transaction, since an inner block would commit the outer block's writes.
+        """
+        if not self.conn.in_transaction:
+            self.conn.execute("BEGIN")
+        try:
+            yield
+            self.commit()
+        except BaseException:
+            self.conn.rollback()
+            raise
 
     @staticmethod
     def _assert_inserted(cursor: sqlite3.Cursor) -> int:

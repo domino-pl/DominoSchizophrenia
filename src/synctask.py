@@ -1022,14 +1022,14 @@ class SyncTask:
         if self.sync_plan_file.exists():
             raise FileExistsError(self.sync_plan_file)
 
-        self.db.sync_clear()
-        self.db.sync_create_table()
-        self.db.sync_fill_table(self.src_storage.id, self.dst_storage.id)
-        self.db.sync_mark_sync_state()
-        self.db.sync_find_strategy()
-        while self.db.sync_iter_solving_move_strategy():
-            pass
-        self.db.commit()
+        with self.db.write_transaction():
+            self.db.sync_clear()
+            self.db.sync_create_table()
+            self.db.sync_fill_table(self.src_storage.id, self.dst_storage.id)
+            self.db.sync_mark_sync_state()
+            self.db.sync_find_strategy()
+            while self.db.sync_iter_solving_move_strategy():
+                pass
 
         actions: list[SyncFSBaseAction] = []
 

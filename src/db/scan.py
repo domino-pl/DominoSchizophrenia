@@ -158,15 +158,12 @@ class SchizophreniaDBScan(SchizophreniaDBFile):
     def scan_insert(self, storage_id: int) -> Scan:
         """Create a scan at the initial stage.
 
-        Commit the entire current transaction, including earlier pending changes.
-
         Returns:
             The newly created scan record.
 
         """
         sql = "INSERT INTO scan(storage_id, finished_step) VALUES (?, ?)"
         cursor = self.conn.execute(sql, (storage_id, int(ScanStep.INSERT)))
-        self.conn.commit()
         scan_id = self._assert_inserted(cursor)
         return self.scan_select(scan_id)
 
