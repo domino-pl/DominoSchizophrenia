@@ -91,7 +91,8 @@ def scan(
             scan_task.start()
         case ScanAction.RESUME:
             scan_task.resume()
-        # TODO: ABORT
+        case ScanAction.ABORT:
+            scan_task.abort()
         case ScanAction.APPLY:
             scan_task.apply()
 

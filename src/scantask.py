@@ -90,7 +90,11 @@ class ScanTask:
     CHECKSUMS_COMMIT_INTERVAL_S = 60
 
     def __init__(
-        self, db: SchizophreniaDB, storage_name: str, *, progress: bool = False,
+        self,
+        db: SchizophreniaDB,
+        storage_name: str,
+        *,
+        progress: bool = False,
     ) -> None:
         """Bind the task to a database and a registered storage.
 
@@ -305,7 +309,8 @@ class ScanTask:
         log.info("Start checksums calculation.")
         progress = (
             FileProgress(*self.db.scan_checksum_totals(scan))
-            if self.show_progress else NO_PROGRESS
+            if self.show_progress
+            else NO_PROGRESS
         )
         last_commit_time = datetime.now(tz=UTC)
         while files := self.db.scan_select_files_for_checksum_calculation(scan):
@@ -430,10 +435,11 @@ class ScanTask:
         """
         last_scan = self._find_last_storage_scan()
 
-        if not last_scan:
+        accepted_steps = tuple(step for step in ScanStep if step < ScanStep.APPLY)
+        if last_scan is None or last_scan.finished_step not in accepted_steps:
             raise InvalidScanStateError(
-                actual_step=None,
-                expected_steps=tuple(ScanStep),
+                actual_step=last_scan.finished_step if last_scan is not None else None,
+                expected_steps=accepted_steps,
             )
 
         last_step = last_scan.finished_step
@@ -483,6 +489,23 @@ class ScanTask:
 
         """
         self._resume()
+
+    def abort(self) -> None:
+        """Mark the current scan as aborted without applying its results.
+
+        Raises:
+            InvalidScanStateError: If there is no active scan.
+
+        """
+        accepted_steps = tuple(step for step in ScanStep if step < ScanStep.APPLY)
+        with self.db.write_transaction():
+            scan = self._find_last_storage_scan()
+            if scan is None or scan.finished_step not in accepted_steps:
+                raise InvalidScanStateError(
+                    actual_step=scan.finished_step if scan is not None else None,
+                    expected_steps=accepted_steps,
+                )
+            self.db.scan_update_step(scan.id, ScanStep.ABORT)
 
     def apply(self) -> None:
         """Apply prepared scan results to known file records and commit APPLY.

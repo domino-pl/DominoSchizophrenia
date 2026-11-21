@@ -18,10 +18,10 @@ force-exclude = true
 select = ["ALL"]
 explicit-preview-rules = false
 ignore = [
-    #    "D203", # Incompatible with D211.
-    #    "D213", # Incompatible with D212.
-    "TD002", # missing-to-do-author
-    "TD003", # missing-to-do-link
+    "TD002",
+    "TD003",
+    "missing-todo-colon",
+    "missing-todo-description",
 ]
 
 [tool.ruff.lint.per-file-ignores]
