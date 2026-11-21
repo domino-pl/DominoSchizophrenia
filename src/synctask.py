@@ -5,6 +5,7 @@
 import csv
 import io
 import os
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path, PurePath, PurePosixPath
 from typing import TYPE_CHECKING, NamedTuple, Self, override
@@ -78,6 +79,7 @@ class SyncFSActionRow(NamedTuple):
     file_id: str
     uid: str
     move_dst_fid: str
+    dst_mtime: str
 
 
 class SyncPlanError(ValueError):
@@ -149,7 +151,7 @@ class SyncExecutionError(RuntimeError):
 class SyncFSBaseAction:
     """Validate, serialize, and run an action on synchronized files."""
 
-    ACTION_LINE_COLUMNS = 13
+    ACTION_LINE_COLUMNS = 14
     NEED_DST: bool
     PRIORITY: SyncFSActionPriority
 
@@ -179,6 +181,7 @@ class SyncFSBaseAction:
         self.file_info = src_file_info
         self.dst_storage_type = dst_storage_type
         self.dst_rel_path = dst_rel_path
+        self.dst_mtime: str | None = None
 
     def dump(self, operation_id: int) -> str:
         """Serialize the action as a single CSV record.
@@ -212,6 +215,7 @@ class SyncFSBaseAction:
                 if self.file_info.move_dst_fid is None
                 else str(self.file_info.move_dst_fid)
             ),
+            dst_mtime=self.dst_mtime or "",
         )
 
         if any("\n" in field or "\r" in field for field in fields):
@@ -305,6 +309,7 @@ class SyncFSBaseAction:
             dst_storage_type,
             None if not row.dst_rel_path else PurePosixPath(row.dst_rel_path),
         )
+        action.dst_mtime = row.dst_mtime or None
         return operation_id, action
 
     def execute(self, src_path: Path, dst_path: Path | None) -> None:
@@ -366,7 +371,7 @@ class SyncFSBaseAction:
 
         Raises:
             SyncValidationError: If destination validation fails.
-            FileExistsError: If the destination file already exists.
+            FileExistsError: If the destination already exists.
 
         """
         if not self.NEED_DST:
@@ -402,6 +407,15 @@ class SyncFSBaseAction:
         dst_path = self.validate_destination(storages)
         self.execute(src_path, dst_path)
 
+    def _set_destination_mtime(self, path: Path) -> None:
+        """Apply an explicitly planned destination timestamp."""
+        if self.dst_mtime is None:
+            return
+        epoch = datetime(1970, 1, 1, tzinfo=UTC)
+        elapsed = datetime.fromisoformat(self.dst_mtime) - epoch
+        mtime_ns = (elapsed // timedelta(microseconds=1)) * 1_000
+        os.utime(path, ns=(path.stat().st_atime_ns, mtime_ns))
+
 
 class SyncFsActionCopy(SyncFSBaseAction):
     """Copy a file and verify the size and hashes of the copy."""
@@ -418,6 +432,7 @@ class SyncFsActionCopy(SyncFSBaseAction):
         dst_path.touch(exist_ok=False)
         try:
             self._copy_and_verify(src_path, dst_path)
+            self._set_destination_mtime(dst_path)
         except BaseException:
             dst_path.unlink(missing_ok=True)
             raise
@@ -450,6 +465,11 @@ class SyncFsActionMove(SyncFSBaseAction):
 
         dst_path.parent.mkdir(parents=True, exist_ok=True)
         src_path.move(dst_path)
+        try:
+            self._set_destination_mtime(dst_path)
+        except BaseException:
+            dst_path.move(src_path)
+            raise
 
 
 class SyncFsActionRemove(SyncFSBaseAction):
@@ -501,6 +521,7 @@ class SyncFSActionInCopy2LWD(SyncFsActionCopy):
         self,
         src_file_info: SyncFileInfo,
         new_rel_path: PurePosixPath,
+        dst_mtime: str | None = None,
     ) -> None:
         """Build the action with an explicit destination-relative path."""
         super().__init__(
@@ -509,6 +530,7 @@ class SyncFSActionInCopy2LWD(SyncFsActionCopy):
             SyncStorageType.LWD_IN_COPY,
             new_rel_path,
         )
+        self.dst_mtime = dst_mtime if dst_mtime != src_file_info.mtime else None
 
 
 class SyncFSActionChangedMV2LWD(SyncFsActionMove):
@@ -550,6 +572,7 @@ class SyncFSActionMovedMV2LWD(SyncFsActionMove):
         self,
         src_file_info: SyncFileInfo,
         new_rel_path: PurePosixPath,
+        dst_mtime: str | None = None,
     ) -> None:
         """Build the action with an explicit destination-relative path."""
         super().__init__(
@@ -558,6 +581,7 @@ class SyncFSActionMovedMV2LWD(SyncFsActionMove):
             SyncStorageType.LWD_MOVED,
             new_rel_path,
         )
+        self.dst_mtime = dst_mtime if dst_mtime != src_file_info.mtime else None
 
 
 class SyncFSActionMovedMV2Dst(SyncFsActionMove):
@@ -1078,7 +1102,9 @@ class SyncTask:
                             SyncExecutionError.MISSING_SOURCE_OR_DONOR_ROW,
                         )
                     operation_actions.extend((
-                        SyncFSActionInCopy2LWD(in_src, src.rel_path),
+                        SyncFSActionInCopy2LWD(
+                            in_src, src.rel_path, src.mtime,
+                        ),
                         SyncFSActionInMV2Dst(src),
                     ))
                 case SyncStrategy.MOVE_TARGET:
@@ -1087,7 +1113,9 @@ class SyncTask:
                             SyncExecutionError.MISSING_SOURCE_OR_DONOR_ROW,
                         )
                     operation_actions.extend((
-                        SyncFSActionMovedMV2LWD(in_src, src.rel_path),
+                        SyncFSActionMovedMV2LWD(
+                            in_src, src.rel_path, src.mtime,
+                        ),
                         SyncFSActionMovedMV2Dst(src),
                     ))
                 case SyncStrategy.DELETE:
