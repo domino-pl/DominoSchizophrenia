@@ -414,8 +414,22 @@ class SyncFsActionCopy(SyncFSBaseAction):
             raise SyncExecutionError(SyncExecutionError.MISSING_DESTINATION_PATH)
 
         dst_path.parent.mkdir(parents=True, exist_ok=True)
-        copy_result = copy_with_hashes(src_path, dst_path, preserve_mtime=True)
+        # Claim the path before enabling cleanup for this copy attempt.
+        dst_path.touch(exist_ok=False)
+        try:
+            self._copy_and_verify(src_path, dst_path)
+        except BaseException:
+            dst_path.unlink(missing_ok=True)
+            raise
 
+    def _copy_and_verify(self, src_path: Path, dst_path: Path) -> None:
+        """Copy the file and check its size and hashes against the plan.
+
+        Raises:
+            SyncExecutionError: If the copied size or a hash differs from the plan.
+
+        """
+        copy_result = copy_with_hashes(src_path, dst_path, preserve_mtime=True)
         if copy_result.size != self.file_info.size:
             raise SyncExecutionError(SyncExecutionError.SIZE_MISMATCH)
         if copy_result.md5 != self.file_info.md5:
