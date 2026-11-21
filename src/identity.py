@@ -126,8 +126,13 @@ class Identity:
             raise FileNotFoundError(storage_abs_path)
 
         file_path = self.get_real_path(storage_abs_path)
-        with file_path.open("x", encoding="utf-8") as identity_file:
-            identity_file.write(self.to_str())
+        file_path.touch(exist_ok=False)
+        try:
+            with file_path.open("w", encoding="utf-8") as identity_file:
+                identity_file.write(self.to_str())
+        except BaseException:
+            file_path.unlink(missing_ok=True)
+            raise
 
     @staticmethod
     def read_from_storage_dir(storage_path: Path) -> Identity:
