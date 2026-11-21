@@ -64,6 +64,14 @@ class UnsupportedFileTypeError(OSError):
         )
 
 
+class ScanFileChangedError(OSError):
+    """Indicate that a file no longer matches the scan listing."""
+
+    def __init__(self, file_path: Path) -> None:
+        """Identify the file whose metadata changed."""
+        super().__init__(f"File changed since it was listed: {file_path}")
+
+
 class ScanTask:
     """List and identify storage files through resumable database scan stages.
 
@@ -271,6 +279,7 @@ class ScanTask:
 
         Raises:
             InvalidScanStateError: If the latest scan is absent or not at MATCH.
+            ScanFileChangedError: If file metadata changed after listing.
 
         """
         # TODO: Progress (per file and total)
@@ -298,10 +307,20 @@ class ScanTask:
 
                 file_path = self.storage.abs_path / file_info.rel_path
                 with file_path.open("rb") as file:
+                    before = os.fstat(file.fileno())
                     # Feed both hashes from the same bounded file chunks.
                     while chunk := file.read(self.CHUNK_SIZE):
                         md5_hash.update(chunk)
                         sha256_hash.update(chunk)
+                    after = os.fstat(file.fileno())
+
+                if (
+                    before.st_size != file_info.size
+                    or format_mtime(before) != file_info.mtime
+                    or after.st_size != before.st_size
+                    or after.st_mtime_ns != before.st_mtime_ns
+                ):
+                    raise ScanFileChangedError(file_path)
 
                 new_sums.append(
                     ScanItemCheckSums(

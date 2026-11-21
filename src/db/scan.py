@@ -47,10 +47,12 @@ class ScanFileStatus(IntEnum):
 
 
 class FileToChecksumCalculation(NamedTuple):
-    """Scan item identifier and path requiring checksum calculation."""
+    """Scan item path and listed metadata for checksum calculation."""
 
     item_id: int
     rel_path: PurePosixPath
+    size: int
+    mtime: str
 
 
 class Scan(NamedTuple):
@@ -304,7 +306,7 @@ class SchizophreniaDBScan(SchizophreniaDBFile):
         """
         # Select incomplete checksum pairs so interrupted calculations can resume.
         sql = """
-              SELECT id, rel_path
+              SELECT id, rel_path, size, mtime
               FROM scan_item
               WHERE scan_id = ?
                 AND status IN (?,?)
@@ -319,6 +321,8 @@ class SchizophreniaDBScan(SchizophreniaDBFile):
             FileToChecksumCalculation(
                 item_id=int(row[0]),
                 rel_path=PurePosixPath(str(row[1])),
+                size=int(row[2]),
+                mtime=str(row[3]),
             )
             for row in cursor.fetchall()
         ]
