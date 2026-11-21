@@ -7,8 +7,9 @@ import logging
 import os
 import stat
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
-from hashlib import md5, sha256
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
 
@@ -17,6 +18,7 @@ from src.identity import IDENTITY_FILE_NAME
 from src.tools import (
     NO_PROGRESS,
     FileProgress,
+    file_checksums,
     format_mtime,
     format_size,
     raise_walk_error,
@@ -70,14 +72,6 @@ class UnsupportedFileTypeError(OSError):
         )
 
 
-class ScanFileChangedError(OSError):
-    """Indicate that a file no longer matches the scan listing."""
-
-    def __init__(self, file_path: Path) -> None:
-        """Identify the file whose metadata changed."""
-        super().__init__(f"File changed since it was listed: {file_path}")
-
-
 class ScanTask:
     """List and identify storage files through resumable database scan stages.
 
@@ -95,6 +89,7 @@ class ScanTask:
         storage_name: str,
         *,
         progress: bool = False,
+        parallel_checksums: bool = True,
     ) -> None:
         """Bind the task to a database and a registered storage.
 
@@ -102,10 +97,12 @@ class ScanTask:
             db: Database used to read storage details and persist scan results.
             storage_name: Name of the registered storage to scan.
             progress: Whether to report checksum progress.
+            parallel_checksums: Whether to compute the two digests on separate threads.
 
         """
         self.db = db
         self.show_progress = progress
+        self.parallel_checksums = parallel_checksums
         self.storage = self.db.select_storage(storage_name)
 
     def _find_last_storage_scan(self) -> Scan | None:
@@ -295,7 +292,6 @@ class ScanTask:
 
         Raises:
             InvalidScanStateError: If the latest scan is absent or not at MATCH.
-            ScanFileChangedError: If file metadata changed after listing.
 
         """
         scan = self._find_last_storage_scan()
@@ -312,61 +308,52 @@ class ScanTask:
             if self.show_progress
             else NO_PROGRESS
         )
-        last_commit_time = datetime.now(tz=UTC)
-        while files := self.db.scan_select_files_for_checksum_calculation(scan):
-            new_sums: list[ScanItemCheckSums] = []
+        pool = (
+            ThreadPoolExecutor(max_workers=2)
+            if self.parallel_checksums
+            else nullcontext(enter_result=None)
+        )
+        with pool as executor:
+            last_commit_time = datetime.now(tz=UTC)
+            while files := self.db.scan_select_files_for_checksum_calculation(scan):
+                new_sums: list[ScanItemCheckSums] = []
 
-            for file_info in files:
-                log.debug("Calculating sums for '%s'.", file_info.rel_path)
-                progress.start_file(file_info.rel_path.as_posix(), file_info.size)
-                md5_hash = md5()  # ruff: ignore[hashlib-insecure-hash-function]
-                sha256_hash = sha256()
+                for file_info in files:
+                    log.debug("Calculating sums for '%s'.", file_info.rel_path)
+                    progress.start_file(file_info.rel_path.as_posix(), file_info.size)
+                    md5_digest, sha256_digest = file_checksums(
+                        self.storage.abs_path / file_info.rel_path,
+                        expected_metadata=(file_info.size, file_info.mtime),
+                        chunk_size=self.CHUNK_SIZE,
+                        progress=progress,
+                        executor=executor,
+                    )
+                    progress.finish_file()
+                    new_sums.append(
+                        ScanItemCheckSums(
+                            item_id=file_info.item_id,
+                            md5=md5_digest,
+                            sha256=sha256_digest,
+                        ),
+                    )
 
-                file_path = self.storage.abs_path / file_info.rel_path
-                with file_path.open("rb") as file:
-                    before = os.fstat(file.fileno())
-                    # Feed both hashes from the same bounded file chunks.
-                    while chunk := file.read(self.CHUNK_SIZE):
-                        md5_hash.update(chunk)
-                        sha256_hash.update(chunk)
-                        progress.advance(len(chunk))
-                    after = os.fstat(file.fileno())
+                    log.debug(
+                        "Calculated sums: md5=%s, sha256=%s.",
+                        new_sums[-1].md5,
+                        new_sums[-1].sha256,
+                    )
 
-                if (
-                    before.st_size != file_info.size
-                    or format_mtime(before) != file_info.mtime
-                    or after.st_size != before.st_size
-                    or after.st_mtime_ns != before.st_mtime_ns
-                ):
-                    raise ScanFileChangedError(file_path)
+                    if datetime.now(tz=UTC) > last_commit_time + timedelta(
+                        seconds=self.CHECKSUMS_COMMIT_INTERVAL_S,
+                    ):
+                        # Persist progress during long checksum batches.
+                        with self.db.write_transaction():
+                            self.db.scan_update_scan_items_sum(new_sums)
+                        new_sums = []
+                        last_commit_time = datetime.now(tz=UTC)
 
-                progress.finish_file()
-
-                new_sums.append(
-                    ScanItemCheckSums(
-                        item_id=file_info.item_id,
-                        md5=md5_hash.hexdigest(),
-                        sha256=sha256_hash.hexdigest(),
-                    ),
-                )
-
-                log.debug(
-                    "Calculated sums: md5=%s, sha256=%s.",
-                    new_sums[-1].md5,
-                    new_sums[-1].sha256,
-                )
-
-                if datetime.now(tz=UTC) > last_commit_time + timedelta(
-                    seconds=self.CHECKSUMS_COMMIT_INTERVAL_S,
-                ):
-                    # Persist progress during long checksum batches.
-                    with self.db.write_transaction():
-                        self.db.scan_update_scan_items_sum(new_sums)
-                    new_sums = []
-                    last_commit_time = datetime.now(tz=UTC)
-
-            with self.db.write_transaction():
-                self.db.scan_update_scan_items_sum(new_sums)
+                with self.db.write_transaction():
+                    self.db.scan_update_scan_items_sum(new_sums)
 
         with self.db.write_transaction():
             self.db.scan_update_step(scan.id, ScanStep.CHECKSUM)

@@ -4,8 +4,9 @@
 
 import sqlite3
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -117,6 +118,7 @@ def test_cli_dispatches_typed_actions(
     assert schizophrenia.main() == 0
 
     handler.assert_called_once()
+    assert handler.call_args.kwargs["parallel_checksums"] is True
     if isinstance(action, ScanAction):
         assert handler.call_args.args[2] is action
     else:
@@ -134,7 +136,7 @@ def test_cli_makes_optional_sync_paths_absolute(
     handler = Mock()
     arguments = [
         "schizophrenia.py", "sync", "prepare", "src", "dst", "plan.csv",
-        "--via", "via dir", "--lwd", "work dir", "--progress",
+        "--via", "via dir", "--lwd", "work dir", "--progress", "--no-parallel",
     ]
     monkeypatch.setattr(sys, "argv", arguments)
     monkeypatch.setattr(schizophrenia, "SchizophreniaDB", db_factory)
@@ -146,6 +148,7 @@ def test_cli_makes_optional_sync_paths_absolute(
         db_factory.return_value, "src", "dst", tmp_path / "plan.csv",
         SyncAction.PREPARE, tmp_path / "via dir", tmp_path / "work dir",
         progress=True,
+        parallel_checksums=False,
     )
 
 
@@ -200,13 +203,22 @@ def test_cli_registers_and_applies_scan_across_invocations(
     file_path = storage / "notes.txt"
     file_path.write_bytes(b"notes")
 
-    for arguments in (
-        ["add_storage", "test", storage.name],
-        ["-p", "scan", "start", "test"],
-        ["scan", "apply", "test"],
-    ):
-        monkeypatch.setattr(sys, "argv", ["schizophrenia.py", *arguments])
-        assert schizophrenia.main() == 0
+    with patch.object(
+        ThreadPoolExecutor,
+        "submit",
+        autospec=True,
+        side_effect=ThreadPoolExecutor.submit,
+    ) as submit:
+        for arguments in (
+            ["add_storage", "test", storage.name],
+            ["-p", "scan", "start", "test"],
+            ["scan", "apply", "test"],
+        ):
+            monkeypatch.setattr(sys, "argv", ["schizophrenia.py", *arguments])
+            assert schizophrenia.main() == 0
+
+    expected_hash_tasks = 2
+    assert submit.call_count == expected_hash_tasks
 
     assert capsys.readouterr().err.splitlines() == [
         "[1/1 - 5 B / 5 B (100.0%)]: notes.txt - 5 B / 5 B (100.0%)",

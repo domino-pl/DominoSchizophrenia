@@ -5,6 +5,7 @@
 import os
 import sys
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from hashlib import md5, sha256
 from os import stat_result
 from shutil import SameFileError
@@ -12,8 +13,10 @@ from time import monotonic
 from typing import TYPE_CHECKING, NamedTuple, override
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
+    from concurrent.futures import ThreadPoolExecutor
     from pathlib import Path
+    from typing import BinaryIO
 
 
 def raise_walk_error(error: OSError) -> None:
@@ -135,6 +138,110 @@ def format_mtime(stat: stat_result) -> str:
     return timestamp.isoformat(timespec="microseconds")
 
 
+class FileMetadataChangedError(OSError):
+    """Indicate that a file no longer has its expected metadata."""
+
+    def __init__(self, file_path: Path) -> None:
+        """Identify the file whose metadata changed."""
+        super().__init__(f"File metadata changed: {file_path}")
+
+
+def file_checksums(
+    path: Path,
+    *,
+    expected_metadata: tuple[int, str],
+    chunk_size: int,
+    progress: Progress,
+    executor: ThreadPoolExecutor | None = None,
+) -> tuple[str, str]:
+    """Read a file once, optionally hashing it in parallel.
+
+    Args:
+        path: File to read.
+        expected_metadata: Listed size in bytes and ISO-formatted mtime.
+        chunk_size: Maximum number of bytes read per block.
+        progress: Reporter for hashed bytes.
+        executor: Pool with two workers for parallel hashing, if enabled.
+
+    Returns:
+        The hexadecimal MD5 and SHA-256 digests.
+
+    Raises:
+        FileMetadataChangedError: If the file differs from the expected metadata
+            or changes during reading.
+        ValueError: If chunk_size is not positive.
+
+    """
+    if chunk_size <= 0:
+        msg = "chunk_size must be positive"
+        raise ValueError(msg)
+
+    with path.open("rb") as file:
+        before = os.fstat(file.fileno())
+        if (before.st_size, format_mtime(before)) != expected_metadata:
+            raise FileMetadataChangedError(path)
+
+        chunks = iter(partial(file.read, chunk_size), b"")
+        result = _hash_chunks(chunks, progress.advance, executor)
+        after = os.fstat(file.fileno())
+
+    if after.st_size != before.st_size or after.st_mtime_ns != before.st_mtime_ns:
+        raise FileMetadataChangedError(path)
+    return result.md5, result.sha256
+
+
+def _hash_chunks(
+    chunks: Iterator[bytes],
+    on_chunk: Callable[[int], None],
+    executor: ThreadPoolExecutor | None,
+) -> CopyResult:
+    """Hash sequentially or dispatch to the supplied workers.
+
+    Returns:
+        The processed byte count and hexadecimal MD5 and SHA-256 digests.
+
+    """
+    if executor is not None:
+        return _hash_chunks_parallel(chunks, on_chunk, executor)
+
+    md5_hash = md5()  # ruff: ignore[hashlib-insecure-hash-function]
+    sha256_hash = sha256()
+    size = 0
+    for chunk in chunks:
+        md5_hash.update(chunk)
+        sha256_hash.update(chunk)
+        size += len(chunk)
+        on_chunk(len(chunk))
+    return CopyResult(size, md5_hash.hexdigest(), sha256_hash.hexdigest())
+
+
+def _hash_chunks_parallel(
+    chunks: Iterator[bytes],
+    on_chunk: Callable[[int], None],
+    executor: ThreadPoolExecutor,
+) -> CopyResult:
+    """Read one block ahead while two workers hash the current block.
+
+    Returns:
+        The processed byte count and hexadecimal MD5 and SHA-256 digests.
+
+    """
+    md5_hash = md5()  # ruff: ignore[hashlib-insecure-hash-function]
+    sha256_hash = sha256()
+    size = 0
+    chunk = next(chunks, b"")
+    while chunk:
+        md5_update = executor.submit(md5_hash.update, chunk)
+        sha256_update = executor.submit(sha256_hash.update, chunk)
+        next_chunk = next(chunks, b"")
+        md5_update.result()
+        sha256_update.result()
+        size += len(chunk)
+        on_chunk(len(chunk))
+        chunk = next_chunk
+    return CopyResult(size, md5_hash.hexdigest(), sha256_hash.hexdigest())
+
+
 class CopyResult(NamedTuple):
     """Store the copied byte count and hexadecimal MD5 and SHA-256 digests."""
 
@@ -143,13 +250,26 @@ class CopyResult(NamedTuple):
     sha256: str
 
 
-def copy_with_hashes(
+def _write_chunks(chunks: Iterator[bytes], destination: BinaryIO) -> Iterator[bytes]:
+    """Write blocks to the destination.
+
+    Yields:
+        Each written block, ready to be hashed.
+
+    """
+    for chunk in chunks:
+        destination.write(chunk)
+        yield chunk
+
+
+def copy_with_hashes(  # ruff: ignore[too-many-arguments]
     source: Path,
     destination: Path,
     *,
     chunk_size: int = 1024 * 1024,
     preserve_mtime: bool = False,
     on_chunk: Callable[[int], None] = NO_PROGRESS.advance,
+    executor: ThreadPoolExecutor | None = None,
 ) -> CopyResult:
     """Copy a file while computing its size and MD5 and SHA-256 digests.
 
@@ -160,6 +280,7 @@ def copy_with_hashes(
         preserve_mtime: Whether to retain the source's modification time on
             the destination, preserving the destination's access time.
         on_chunk: Callback receiving the number of bytes written per chunk.
+        executor: Pool with two workers to hash while reading and writing.
 
     Returns:
         The copied byte count and hexadecimal MD5 and SHA-256 digests.
@@ -177,19 +298,10 @@ def copy_with_hashes(
         msg = "Source and destination refer to the same file"
         raise SameFileError(msg)
 
-    md5_hash = md5()  # ruff: ignore[hashlib-insecure-hash-function]
-    sha256_hash = sha256()
-    copied_size = 0
-
     with source.open("rb") as src, destination.open("wb") as dst:
         source_stat = os.fstat(src.fileno())
-
-        while chunk := src.read(chunk_size):
-            md5_hash.update(chunk)
-            sha256_hash.update(chunk)
-            dst.write(chunk)
-            copied_size += len(chunk)
-            on_chunk(len(chunk))
+        chunks = iter(partial(src.read, chunk_size), b"")
+        result = _hash_chunks(_write_chunks(chunks, dst), on_chunk, executor)
 
     if preserve_mtime:
         destination_stat = destination.stat()
@@ -202,8 +314,4 @@ def copy_with_hashes(
             ),
         )
 
-    return CopyResult(
-        size=copied_size,
-        md5=md5_hash.hexdigest(),
-        sha256=sha256_hash.hexdigest(),
-    )
+    return result

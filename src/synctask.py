@@ -5,6 +5,8 @@
 import csv
 import io
 import os
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
@@ -322,7 +324,13 @@ class SyncFSBaseAction:
         action.dst_mtime = row.dst_mtime or None
         return operation_id, action
 
-    def execute(self, src_path: Path, dst_path: Path | None) -> None:
+    def execute(
+        self,
+        src_path: Path,
+        dst_path: Path | None,
+        *,
+        parallel_checksums: bool = False,
+    ) -> None:
         """Apply the filesystem operation for this action.
 
         Raises:
@@ -410,11 +418,16 @@ class SyncFSBaseAction:
 
         return dst_file
 
-    def run(self, storages: SyncStorages) -> None:
+    def run(
+        self,
+        storages: SyncStorages,
+        *,
+        parallel_checksums: bool = False,
+    ) -> None:
         """Validate the paths and execute the action."""
         src_path = self.validate_source(storages)
         dst_path = self.validate_destination(storages)
-        self.execute(src_path, dst_path)
+        self.execute(src_path, dst_path, parallel_checksums=parallel_checksums)
 
     def _report_completed_file(self) -> None:
         """Report the full size of a completed move or removal."""
@@ -440,7 +453,13 @@ class SyncFsActionCopy(SyncFSBaseAction):
     NEED_DST = True
 
     @override
-    def execute(self, src_path: Path, dst_path: Path | None) -> None:
+    def execute(
+        self,
+        src_path: Path,
+        dst_path: Path | None,
+        *,
+        parallel_checksums: bool = False,
+    ) -> None:
         if dst_path is None:
             raise SyncExecutionError(SyncExecutionError.MISSING_DESTINATION_PATH)
 
@@ -451,26 +470,41 @@ class SyncFsActionCopy(SyncFSBaseAction):
         # Claim the path before enabling cleanup for this copy attempt.
         dst_path.touch(exist_ok=False)
         try:
-            self._copy_and_verify(src_path, dst_path)
+            self._copy_and_verify(
+                src_path, dst_path, parallel_checksums=parallel_checksums,
+            )
             self._set_destination_mtime(dst_path)
         except BaseException:
             dst_path.unlink(missing_ok=True)
             raise
         self.progress.finish_file()
 
-    def _copy_and_verify(self, src_path: Path, dst_path: Path) -> None:
+    def _copy_and_verify(
+        self,
+        src_path: Path,
+        dst_path: Path,
+        *,
+        parallel_checksums: bool,
+    ) -> None:
         """Copy the file and check its size and hashes against the plan.
 
         Raises:
             SyncExecutionError: If the copied size or a hash differs from the plan.
 
         """
-        copy_result = copy_with_hashes(
-            src_path,
-            dst_path,
-            preserve_mtime=True,
-            on_chunk=self.progress.advance,
+        pool = (
+            ThreadPoolExecutor(max_workers=2)
+            if parallel_checksums
+            else nullcontext(enter_result=None)
         )
+        with pool as executor:
+            copy_result = copy_with_hashes(
+                src_path,
+                dst_path,
+                preserve_mtime=True,
+                on_chunk=self.progress.advance,
+                executor=executor,
+            )
         if copy_result.size != self.file_info.size:
             raise SyncExecutionError(SyncExecutionError.SIZE_MISMATCH)
         if copy_result.md5 != self.file_info.md5:
@@ -485,7 +519,13 @@ class SyncFsActionMove(SyncFSBaseAction):
     NEED_DST = True
 
     @override
-    def execute(self, src_path: Path, dst_path: Path | None) -> None:
+    def execute(
+        self,
+        src_path: Path,
+        dst_path: Path | None,
+        *,
+        parallel_checksums: bool = False,
+    ) -> None:
         if dst_path is None:
             raise SyncExecutionError(SyncExecutionError.MISSING_DESTINATION_PATH)
 
@@ -505,7 +545,13 @@ class SyncFsActionRemove(SyncFSBaseAction):
     NEED_DST = False
 
     @override
-    def execute(self, src_path: Path, dst_path: Path | None) -> None:
+    def execute(
+        self,
+        src_path: Path,
+        dst_path: Path | None,
+        *,
+        parallel_checksums: bool = False,
+    ) -> None:
         src_path.unlink()
         self._report_completed_file()
 
@@ -704,6 +750,7 @@ class SyncTask:
         lwd: Path | None = None,
         *,
         progress: bool = False,
+        parallel_checksums: bool = True,
     ) -> None:
         """Bind the plan to its database storages and optional staging paths.
 
@@ -714,6 +761,7 @@ class SyncTask:
         """
         self.db = db
         self.show_progress = progress
+        self.parallel_checksums = parallel_checksums
         self.src_storage = self.db.select_storage(src_storage_name)
         self.dst_storage = self.db.select_storage(dst_storage_name)
         self.sync_plan_file = syncplan_file
@@ -1045,7 +1093,7 @@ class SyncTask:
 
         for operation_id, action in pending:
             action.progress = progress
-            action.run(storages)
+            action.run(storages, parallel_checksums=self.parallel_checksums)
             self._append_completed_action(operation_id)
 
     def run_via(self) -> None:

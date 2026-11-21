@@ -82,9 +82,12 @@ def scan(
     action: ScanAction,
     *,
     progress: bool = False,
+    parallel_checksums: bool = True,
 ) -> None:
     """Run the requested scan operation for a registered storage."""
-    scan_task = ScanTask(db, storage_name, progress=progress)
+    scan_task = ScanTask(
+        db, storage_name, progress=progress, parallel_checksums=parallel_checksums,
+    )
 
     match action:
         case ScanAction.START:
@@ -107,11 +110,13 @@ def sync(  # ruff: ignore[too-many-arguments, too-many-positional-arguments]
     lwd: Path | None = None,
     *,
     progress: bool = False,
+    parallel_checksums: bool = True,
 ) -> None:
     """Run the requested synchronization stage for two registered storages."""
     sync_task = SyncTask(
         db, src_storage_name, dst_storage_name, syncplan_file, via, lwd,
         progress=progress,
+        parallel_checksums=parallel_checksums,
     )
 
     match action:
@@ -136,7 +141,12 @@ def main() -> int:
     """
     parser = ArgumentParser()
     progress_help = "Show checksum and copy progress."
+    parallel_help = "Compute checksums sequentially."
     parser.add_argument("-p", "--progress", action="store_true", help=progress_help)
+    parser.add_argument(
+        "--no-parallel", action="store_false", dest="parallel_checksums",
+        help=parallel_help,
+    )
     commands = parser.add_subparsers(
         dest="command",
         required=True,
@@ -162,6 +172,10 @@ def main() -> int:
             "-p", "--progress", action="store_true", default=SUPPRESS,
             help=progress_help,
         )
+        command_parser.add_argument(
+            "--no-parallel", action="store_false", dest="parallel_checksums",
+            default=SUPPRESS, help=parallel_help,
+        )
 
     args = parser.parse_args()
     action = getattr(args, "action", None)
@@ -171,7 +185,10 @@ def main() -> int:
         if args.command == "add_storage":
             add_storage(db, args.storage_name, args.path.absolute())
         elif args.command == "scan" and isinstance(action, ScanAction):
-            scan(db, args.storage_name, action, progress=args.progress)
+            scan(
+                db, args.storage_name, action, progress=args.progress,
+                parallel_checksums=args.parallel_checksums,
+            )
         elif args.command == "sync" and isinstance(action, SyncAction):
             sync(
                 db,
@@ -182,6 +199,7 @@ def main() -> int:
                 args.via.absolute() if args.via else None,
                 args.lwd.absolute() if args.lwd else None,
                 progress=args.progress,
+                parallel_checksums=args.parallel_checksums,
             )
 
     finally:

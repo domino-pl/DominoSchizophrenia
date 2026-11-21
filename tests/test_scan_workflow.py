@@ -14,12 +14,8 @@ import pytest
 from src.db.base import FetchEmptyError
 from src.db.scan import ScanStep
 from src.identity import IDENTITY_FILE_NAME, Identity
-from src.scantask import (
-    InvalidScanStateError,
-    ScanFileChangedError,
-    ScanTask,
-    UnsupportedFileTypeError,
-)
+from src.scantask import InvalidScanStateError, ScanTask, UnsupportedFileTypeError
+from src.tools import FileMetadataChangedError
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -55,8 +51,17 @@ def test_storage_metadata_round_trip(empty_db: SchizophreniaDB, tmp_path: Path) 
         empty_db.select_storage("missing")
 
 
-def test_scan_apply_reuses_uid_for_identical_content(scan_task: ScanTask) -> None:
+@pytest.mark.parametrize(
+    "parallel_checksums", [False, True], ids=["sequential", "parallel"],
+)
+def test_scan_apply_reuses_uid_for_identical_content(
+    scan_task: ScanTask, monkeypatch: pytest.MonkeyPatch, *, parallel_checksums: bool,
+) -> None:
     """Apply two equal files and exclude the root identity marker."""
+    scan_task = ScanTask(
+        scan_task.db, scan_task.storage.name, parallel_checksums=parallel_checksums,
+    )
+    monkeypatch.setattr(scan_task, "CHUNK_SIZE", 2)
     root = scan_task.storage.abs_path
     (root / "a.txt").write_bytes(b"abc")
     (root / "b.txt").write_bytes(b"abc")
@@ -69,6 +74,12 @@ def test_scan_apply_reuses_uid_for_identical_content(scan_task: ScanTask) -> Non
     rows = conn.execute("SELECT rel_path, uid FROM file ORDER BY rel_path").fetchall()
     assert [path for path, _ in rows] == ["a.txt", "b.txt"]
     assert len({uid for _, uid in rows}) == 1
+    assert conn.execute("SELECT DISTINCT md5, sha256 FROM file").fetchall() == [
+        (
+            "900150983cd24fb0d6963f7d28e17f72",
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        ),
+    ]
     steps = conn.execute("SELECT finished_step FROM scan").fetchall()
     assert steps == [(ScanStep.APPLY,)]
 
@@ -319,7 +330,7 @@ def test_resume_rejects_file_changed_since_listing(
     if len(updated_content) == original.st_size:
         mtime_ns -= 10_000_000_000
     os.utime(file_path, ns=(original.st_atime_ns, mtime_ns))
-    with pytest.raises(ScanFileChangedError, match="File changed since it was listed"):
+    with pytest.raises(FileMetadataChangedError, match="File metadata changed"):
         scan_task.resume()
     with pytest.raises(InvalidScanStateError):
         scan_task.apply()

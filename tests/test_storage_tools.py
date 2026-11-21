@@ -5,7 +5,8 @@
 import errno
 import os
 import sqlite3
-from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
 from pathlib import PureWindowsPath
 from shutil import SameFileError
 from typing import TYPE_CHECKING
@@ -145,7 +146,10 @@ def test_format_mtime_truncates_to_utc_microseconds() -> None:
     assert format_mtime(file_stat) == "1970-01-01T00:00:01.234567+00:00"
 
 
-def test_copy_with_hashes_preserves_content_and_mtime(tmp_path: Path) -> None:
+@pytest.mark.parametrize("parallel", [False, True], ids=["sequential", "parallel"])
+def test_copy_with_hashes_preserves_content_and_mtime(
+    tmp_path: Path, *, parallel: bool,
+) -> None:
     """Copy over multiple chunks and preserve the source timestamp."""
     source = tmp_path / "source"
     destination = tmp_path / "destination"
@@ -154,7 +158,15 @@ def test_copy_with_hashes_preserves_content_and_mtime(tmp_path: Path) -> None:
     timestamp = 1_700_000_000
     os.utime(source, (timestamp, timestamp))
 
-    result = copy_with_hashes(source, destination, chunk_size=2, preserve_mtime=True)
+    written_chunks: list[int] = []
+    pool = ThreadPoolExecutor(max_workers=2) if parallel else nullcontext()
+    with pool as executor:
+        result = copy_with_hashes(
+            source, destination, chunk_size=2, preserve_mtime=True,
+            on_chunk=written_chunks.append,
+            executor=executor,
+        )
+    assert written_chunks == [2, 1]
 
     assert result == CopyResult(
         size=3,

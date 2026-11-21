@@ -4,9 +4,11 @@
 
 import csv
 import os
-from pathlib import PurePosixPath
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path, PurePosixPath
 from shutil import copystat
-from typing import TYPE_CHECKING
+from threading import Barrier, Event
+from typing import TYPE_CHECKING, cast
 from unittest.mock import patch
 
 import pytest
@@ -28,7 +30,9 @@ from src.synctask import (
 )
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    from collections.abc import Callable
+    from concurrent.futures import Future
+    from typing import IO, BinaryIO
 
     from src.db import SchizophreniaDB
 
@@ -180,17 +184,28 @@ def test_run_via_rejects_invalid_action_log_before_transfer(
 
 
 @pytest.mark.parametrize("show_progress", [False, True])
+@pytest.mark.parametrize("parallel_checksums", [False, True])
 def test_run_sync_copies_new_file_and_skips_completed_actions(
     prepared_plan: SyncTask,
     capsys: pytest.CaptureFixture[str],
     *,
     show_progress: bool,
+    parallel_checksums: bool,
 ) -> None:
     """Copy through transfer and local staging and replay without new work."""
     prepared_plan.show_progress = show_progress
+    if not parallel_checksums:
+        prepared_plan.parallel_checksums = False
     prepared_plan.init_via()
     prepared_plan.init_lwd()
-    prepared_plan.run_via()
+    with patch.object(
+        ThreadPoolExecutor,
+        "submit",
+        autospec=True,
+        side_effect=ThreadPoolExecutor.submit,
+    ) as submit:
+        prepared_plan.run_via()
+    assert submit.call_count == (2 if parallel_checksums else 0)
 
     destination = prepared_plan.dst_storage.abs_path / "new.txt"
     assert not destination.exists()
@@ -214,6 +229,77 @@ def test_run_sync_copies_new_file_and_skips_completed_actions(
     assert destination.read_bytes() == b"new contents"
     assert _completed_actions(prepared_plan) == ["1,done", "2,done", "3,done"]
     assert not capsys.readouterr().err
+
+
+def test_sync_writes_next_block_while_hash_updates_are_pending(
+    sync_task: SyncTask, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prove that copying writes the next block before either hash task returns."""
+    first_block = b"a" * (1024 * 1024)
+    second_block = b"b"
+    content = first_block + second_block
+    source = sync_task.src_storage.abs_path / "new.txt"
+    source.write_bytes(content)
+    _prepare_plan(sync_task)
+    sync_task.init_via()
+    via = sync_task.via
+    assert via is not None
+    destination = via / source.name
+
+    hashing_started = Barrier(3, timeout=5)
+    second_block_written = Event()
+    real_submit = ThreadPoolExecutor.submit
+    real_open = Path.open
+
+    def submit_hash(
+        executor: ThreadPoolExecutor, update: Callable[[bytes], None], chunk: bytes,
+    ) -> Future[None]:
+        def update_hash() -> None:
+            if chunk == first_block:
+                hashing_started.wait()
+                assert second_block_written.wait(timeout=5)
+            update(chunk)
+
+        return real_submit(executor, update_hash)
+
+    def open_file(
+        path: Path,
+        mode: str = "r",
+        *,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+    ) -> IO[str] | IO[bytes]:
+        if path != destination or mode != "wb":
+            return cast(
+                "IO[str] | IO[bytes]",
+                real_open(
+                    path, mode, encoding=encoding, errors=errors, newline=newline,
+                ),
+            )
+
+        file: BinaryIO = real_open(path, "wb")
+        real_write = file.write
+
+        def write(chunk: bytes) -> int:
+            if chunk != second_block:
+                return real_write(chunk)
+            hashing_started.wait()
+            written = real_write(chunk)
+            second_block_written.set()
+            return written
+
+        monkeypatch.setattr(file, "write", write)
+        return file
+
+    with monkeypatch.context() as patches:
+        patches.setattr(ThreadPoolExecutor, "submit", submit_hash)
+        patches.setattr(Path, "open", open_file)
+        sync_task.run_via()
+
+    assert second_block_written.is_set()
+    assert destination.read_bytes() == content
+    assert _completed_actions(sync_task) == ["1,done"]
 
 
 def test_failed_action_is_not_marked_done(prepared_plan: SyncTask) -> None:
