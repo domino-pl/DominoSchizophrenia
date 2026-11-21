@@ -391,7 +391,7 @@ class SyncFSBaseAction:
 
         dst_file = storage.path / self.dst_rel_path
 
-        if dst_file.exists():
+        if dst_file.exists() or dst_file.is_symlink():
             raise FileExistsError(dst_file)
 
         return dst_file
