@@ -70,9 +70,12 @@ def add_storage(db: SchizophreniaDB, name: str, storage_abs_path: Path) -> None:
         raise StoragePathNotDirectoryError(storage_abs_path)
 
     identity = Identity.new()
-    identity.save_to_storage_dir(storage_abs_path)
-
     db.insert_storage(name, storage_abs_path, identity)
+    try:
+        identity.save_to_storage_dir(storage_abs_path)
+    except BaseException:
+        db.conn.rollback()
+        raise
     db.commit()
     log.info("Added storage %s with absolute path %s.", name, storage_abs_path)
 

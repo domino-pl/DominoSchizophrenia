@@ -69,10 +69,9 @@ class SchizophreniaDBStorage(SchizophreniaDBBase):
         )
 
     def insert_storage(self, name: str, abs_path: Path, identity: Identity) -> Storage:
-        """Persist a storage configuration and return the saved record.
+        """Insert a storage configuration and return the new record.
 
-        Commit the entire current transaction, including any pending changes
-        made earlier on the same connection.
+        The caller is responsible for committing or rolling back the transaction.
 
         Returns:
             The saved storage record, including its database-generated ID.
@@ -81,6 +80,5 @@ class SchizophreniaDBStorage(SchizophreniaDBBase):
         sql = "INSERT INTO storage(name, abs_path, identity) VALUES (?, ?, ?)"
         # Serialize the path and identity into values supported by the database.
         self.conn.execute(sql, (name, str(abs_path), identity.to_db()))
-        self.conn.commit()
         # Read back the generated ID along with the stored configuration.
         return self.select_storage(name)
