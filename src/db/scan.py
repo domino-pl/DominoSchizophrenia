@@ -89,7 +89,9 @@ class SchizophreniaDBScan(SchizophreniaDBFile):
             (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
                 storage_id    INTEGER NOT NULL,
-                finished_step INTEGER NOT NULL
+                finished_step INTEGER NOT NULL,
+                FOREIGN KEY (storage_id) REFERENCES storage(id)
+                    ON UPDATE RESTRICT ON DELETE RESTRICT
             )
             """,
             # File links, content identities, and checksums are filled in later stages.
@@ -105,7 +107,13 @@ class SchizophreniaDBScan(SchizophreniaDBFile):
                 mtime    TEXT    NOT NULL,
                 status   INTEGER NOT NULL,
                 md5      TEXT    NULL,
-                sha256   TEXT    NULL
+                sha256   TEXT    NULL,
+                FOREIGN KEY (scan_id) REFERENCES scan(id)
+                    ON UPDATE RESTRICT ON DELETE RESTRICT,
+                FOREIGN KEY (file_id) REFERENCES file(id)
+                    ON UPDATE RESTRICT ON DELETE RESTRICT,
+                FOREIGN KEY (uid) REFERENCES uids(uid)
+                    ON UPDATE RESTRICT ON DELETE RESTRICT
             )
             """,
             # A path can appear only once within a scan.
@@ -429,21 +437,32 @@ class SchizophreniaDBScan(SchizophreniaDBFile):
             The number of deleted file records.
 
         """
-        sql = """
-              DELETE
-              FROM file
-              WHERE id IN
-                    (SELECT file_id
-                     FROM scan_item
-                     WHERE scan_id = ?
-                       AND status = ?)
-              """
-
         log.debug(
             "Removing file records of files scanned as deleted for scan %s.",
             scan_id,
         )
-        cursor = self.conn.execute(sql, (scan_id, int(ScanFileStatus.REMOVED)))
+        params = (scan_id, int(ScanFileStatus.REMOVED))
+        self.conn.execute(
+            """
+            UPDATE scan_item
+            SET file_id = NULL
+            WHERE file_id IN (
+                SELECT file_id FROM scan_item WHERE scan_id = ? AND status = ?
+            )
+            """,
+            params,
+        )
+        cursor = self.conn.execute(
+            """
+            DELETE FROM file
+            WHERE (storage_id, rel_path) IN (
+                SELECT scan.storage_id, scan_item.rel_path
+                FROM scan_item JOIN scan ON scan.id = scan_item.scan_id
+                WHERE scan_item.scan_id = ? AND scan_item.status = ?
+            )
+            """,
+            params,
+        )
         log.debug(
             "Removed %s file records of files scanned as deleted.",
             cursor.rowcount,

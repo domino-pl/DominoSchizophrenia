@@ -33,6 +33,7 @@ class SchizophreniaDBBase:
         """Open the application database and run the initialization hook."""
         self.conn = sqlite3.connect("schizophrenia.db")
         try:
+            self.conn.execute("PRAGMA foreign_keys = ON")
             with self.write_transaction():
                 self._init_db()
         except BaseException:

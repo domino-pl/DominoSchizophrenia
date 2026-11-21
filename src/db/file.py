@@ -45,7 +45,11 @@ class SchizophreniaDBFile(SchizophreniaDBStorage):
                 size       INTEGER NOT NULL,
                 mtime      TEXT    NOT NULL,
                 md5        TEXT    NOT NULL,
-                sha256     TEXT    NOT NULL
+                sha256     TEXT    NOT NULL,
+                FOREIGN KEY (storage_id) REFERENCES storage(id)
+                    ON UPDATE RESTRICT ON DELETE RESTRICT,
+                FOREIGN KEY (uid) REFERENCES uids(uid)
+                    ON UPDATE RESTRICT ON DELETE RESTRICT
             )
             """,
             # A relative path must be unique within a storage.

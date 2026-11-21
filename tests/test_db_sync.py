@@ -8,20 +8,40 @@ from typing import TYPE_CHECKING
 import pytest
 
 from src.db.sync import SyncFileStatus, SyncPlanningError, SyncStrategy
+from src.identity import Identity
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from src.db.sync import SchizophreniaDBSync
 
 
 @pytest.fixture
-def db(empty_db: SchizophreniaDBSync) -> SchizophreniaDBSync:
+def planning_db(empty_db: SchizophreniaDBSync, tmp_path: Path) -> SchizophreniaDBSync:
+    """Create the parent rows required by planner fixtures.
+
+    Returns:
+        The database with both storages and five content identities.
+
+    """
+    for name in ("src", "dst"):
+        empty_db.insert_storage(name, tmp_path / name, Identity.new())
+    empty_db.conn.executemany(
+        "INSERT INTO uids(uid, size, md5, sha256) VALUES (?, 1, ?, ?)",
+        [(uid, str(uid), str(uid)) for uid in range(1, 6)],
+    )
+    return empty_db
+
+
+@pytest.fixture
+def db(planning_db: SchizophreniaDBSync) -> SchizophreniaDBSync:
     """Populate the shared-donor scenario and prepare its initial sync plan.
 
     Returns:
         A database with source a:X, b:X, c:Y and destination a:Y, b:Y, c:X.
 
     """
-    empty_db.conn.executemany(
+    planning_db.conn.executemany(
         """
         INSERT INTO file(storage_id, rel_path, uid, size, mtime, md5, sha256)
         VALUES (?, ?, ?, 1, '2026-11-08', ?, ?)
@@ -35,11 +55,11 @@ def db(empty_db: SchizophreniaDBSync) -> SchizophreniaDBSync:
             for path, uid in contents
         ],
     )
-    empty_db.sync_create_table()
-    empty_db.sync_fill_table(1, 2)
-    empty_db.sync_mark_sync_state()
-    empty_db.sync_find_strategy()
-    return empty_db
+    planning_db.sync_create_table()
+    planning_db.sync_fill_table(1, 2)
+    planning_db.sync_mark_sync_state()
+    planning_db.sync_find_strategy()
+    return planning_db
 
 
 @pytest.mark.parametrize("passes", [1, 2, 3])
@@ -69,10 +89,10 @@ def test_assigned_actions_and_file_ids(db: SchizophreniaDBSync, passes: int) -> 
 
 
 def test_planner_classifies_paths_and_assigns_strategies(
-    empty_db: SchizophreniaDBSync,
+    planning_db: SchizophreniaDBSync,
 ) -> None:
     """Choose a strategy for new, removed, changed, and unchanged paths."""
-    empty_db.conn.executemany(
+    planning_db.conn.executemany(
         """
         INSERT INTO file(storage_id, rel_path, uid, size, mtime, md5, sha256)
         VALUES (?, ?, ?, 1, '2026-11-08', 'md5', 'sha256')
@@ -86,13 +106,13 @@ def test_planner_classifies_paths_and_assigns_strategies(
             (2, "removed", 5),
         ],
     )
-    empty_db.sync_create_table()
-    empty_db.sync_fill_table(1, 2)
-    empty_db.sync_mark_sync_state()
-    empty_db.sync_find_strategy()
+    planning_db.sync_create_table()
+    planning_db.sync_fill_table(1, 2)
+    planning_db.sync_mark_sync_state()
+    planning_db.sync_find_strategy()
 
     observed = {}
-    for row in empty_db.sync_iter_entries():
+    for row in planning_db.sync_iter_entries():
         file_info = row.src if row.src is not None else row.dst
         assert file_info is not None
         observed[file_info.rel_path.as_posix()] = (row.sync_status, row.sync_strategy)
