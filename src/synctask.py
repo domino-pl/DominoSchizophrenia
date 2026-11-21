@@ -128,6 +128,9 @@ class SyncValidationError(RuntimeError):
     MISSING_SOURCE_FIELDS = "Source src_storage_type or file_info is None"
     UNAVAILABLE_SOURCE = "Source file not found"
     ABSOLUTE_SOURCE_PATH = "Source file path is absolute"
+    SOURCE_MTIME_MISMATCH = (
+        "Source modification time changed for {} (expected {}, got {})"
+    )
     UNEXPECTED_DESTINATION_FIELDS = "dst_storage_type or dst_rel_path is not None"
     MISSING_DESTINATION_FIELDS = "dst_storage_type or dst_rel_path is None"
     UNAVAILABLE_DESTINATION = "Destination file storage does not found"
@@ -352,12 +355,11 @@ class SyncFSBaseAction:
         file_stat = src_file.stat()
         mtime = format_mtime(file_stat)
         if mtime != self.file_info.mtime:
-            prompt = (
-                f"Bad mtime for {src_file} - wanted {mtime} "
-                f"- got {self.file_info.mtime}.\n"
+            raise SyncValidationError(
+                SyncValidationError.SOURCE_MTIME_MISMATCH.format(
+                    src_file, self.file_info.mtime, mtime,
+                ),
             )
-            if input(prompt) != "y":  # TODO
-                raise SyncValidationError(src_file)
         if file_stat.st_size != self.file_info.size:
             raise SyncValidationError(src_file)
 

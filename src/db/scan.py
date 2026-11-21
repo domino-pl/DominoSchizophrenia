@@ -149,7 +149,6 @@ class SchizophreniaDBScan(SchizophreniaDBFile):
             The latest scan by ID, or `None` if the storage has no scans.
 
         """
-        # TODO: ORDER BY TIME
         sql = "SELECT id FROM scan WHERE storage_id = ? ORDER BY id DESC LIMIT 1"
         cursor = self.conn.execute(sql, (storage_id,))
         row = cursor.fetchone()
@@ -220,8 +219,7 @@ class SchizophreniaDBScan(SchizophreniaDBFile):
                          AND file.rel_path = scan_item.rel_path)
               WHERE scan_item.scan_id = ?
               """
-        self.conn.execute(sql, (scan.storage_id, scan.id))
-        # TODO: Print count.
+        listed_count = self.conn.execute(sql, (scan.storage_id, scan.id)).rowcount
 
         log.debug("Mark new files.")
         sql = """
@@ -231,6 +229,7 @@ class SchizophreniaDBScan(SchizophreniaDBFile):
                 AND file_id IS NULL
               """
         cursor = self.conn.execute(sql, (int(ScanFileStatus.NEW), scan.id))
+        log.debug("Matched %s known files.", listed_count - cursor.rowcount)
         log.debug("Marked %s new files.", cursor.rowcount)
 
         log.debug("Looking for deleted files.")

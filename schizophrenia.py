@@ -86,7 +86,6 @@ def scan(db: SchizophreniaDB, storage_name: str, action: ScanAction) -> None:
         case ScanAction.RESUME:
             scan_task.resume()
         # TODO: ABORT
-        # TODO: SHOW
         case ScanAction.APPLY:
             scan_task.apply()
 

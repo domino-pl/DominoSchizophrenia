@@ -146,7 +146,9 @@ class ScanTask:
         if sys.platform.startswith("linux"):
             try:
                 raw_attributes = os.getxattr(
-                    directory, "system.ntfs_attrib_be", follow_symlinks=False,
+                    directory,
+                    "system.ntfs_attrib_be",
+                    follow_symlinks=False,
                 )
             except OSError as error:
                 if error.errno in {errno.ENODATA, errno.ENOTSUP}:
@@ -203,7 +205,10 @@ class ScanTask:
 
                 for file in filenames:
                     # The root identity file describes the storage, not user data.
-                    if current_dir == self.storage.abs_path and file == IDENTITY_FILE_NAME:
+                    if (
+                        current_dir == self.storage.abs_path
+                        and file == IDENTITY_FILE_NAME
+                    ):
                         log.info(
                             "Skipping identity file %s in %s.",
                             IDENTITY_FILE_NAME,
@@ -387,7 +392,11 @@ class ScanTask:
                 expected_steps=expected_steps,
             )
 
-        # TODO: log
+        log.info(
+            "Assign content UIDs for scan %s in storage %s.",
+            scan.id,
+            self.storage.name,
+        )
         with self.db.write_transaction():
             self.db.scan_assign_scan_new_uid(scan.id)
             self.db.scan_update_step(scan.id, ScanStep.ASSIGN_UID)

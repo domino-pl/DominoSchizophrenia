@@ -116,6 +116,10 @@ class SyncResultRow(NamedTuple):
     in_src: SyncFileInfo | None
 
 
+class SyncPlanningError(RuntimeError):
+    """Indicate that one or more sync entries could not be resolved."""
+
+
 class SchizophreniaDBSync(SchizophreniaDBScan):
     """Manage synchronization planning tables and operations.
 
@@ -193,85 +197,44 @@ class SchizophreniaDBSync(SchizophreniaDBScan):
         """Classify `UNKNOWN` entries by file presence and content identity.
 
         Assign `DO_NOTHING` to unchanged files and `UNDETERMINED` to the rest.
+
+        Raises:
+            SyncPlanningError: If any entry remains unknown.
+
         """
-        # TODO: for
         # Classify absent files first; UID comparisons apply to the remaining pairs.
-        sql = """
-              UPDATE tmp_sync_calc
-              SET sync_status   = ?,
-                  sync_strategy = ?
-              WHERE sync_status = ?
-                AND dst_fid IS NULL
-              """
-
-        log.debug("Marking file sync state as %s.", SyncFileStatus.APPEARED)
-        cursor = self.conn.execute(
-            sql,
-            (
-                SyncFileStatus.APPEARED,
-                SyncStrategy.UNDETERMINED,
-                SyncFileStatus.UNKNOWN,
-            ),
+        rules = (
+            (SyncFileStatus.APPEARED, SyncStrategy.UNDETERMINED, "dst_fid IS NULL"),
+            (SyncFileStatus.DISAPPEARED, SyncStrategy.UNDETERMINED, "src_fid IS NULL"),
+            (SyncFileStatus.CHANGED, SyncStrategy.UNDETERMINED, "src_uid != dst_uid"),
+            (SyncFileStatus.NOT_CHANGED, SyncStrategy.DO_NOTHING, "src_uid = dst_uid"),
         )
-        log.info("%s files marked as %s.", cursor.rowcount, SyncFileStatus.APPEARED)
+        for status, strategy, condition in rules:
+            sql = f"""
+                  UPDATE tmp_sync_calc
+                  SET sync_status = ?, sync_strategy = ?
+                  WHERE sync_status = ? AND {condition}
+                  """  # ruff: ignore[hardcoded-sql-expression]
+            cursor = self.conn.execute(sql, (status, strategy, SyncFileStatus.UNKNOWN))
+            log.info("%s files marked as %s.", cursor.rowcount, status)
 
-        sql = """
-              UPDATE tmp_sync_calc
-              SET sync_status = ?,
-                  sync_strategy = ?
-              WHERE sync_status = ?
-                AND src_fid IS NULL
-              """
-        log.debug("Marking file sync state as %s.", SyncFileStatus.DISAPPEARED)
-        cursor = self.conn.execute(
-            sql,
-            (
-                SyncFileStatus.DISAPPEARED,
-                SyncStrategy.UNDETERMINED,
-                SyncFileStatus.UNKNOWN,
-            ),
-        )
-        log.info("%s files marked as %s.", cursor.rowcount, SyncFileStatus.DISAPPEARED)
-
-        sql = """
-              UPDATE tmp_sync_calc
-              SET sync_status = ?,
-                  sync_strategy = ?
-              WHERE sync_status = ?
-                AND src_uid != dst_uid
-              """
-        log.debug("Marking file sync state as %s.", SyncFileStatus.CHANGED)
-        cursor = self.conn.execute(
-            sql,
-            (SyncFileStatus.CHANGED, SyncStrategy.UNDETERMINED, SyncFileStatus.UNKNOWN),
-        )
-        log.info("%s files marked as %s.", cursor.rowcount, SyncFileStatus.CHANGED)
-
-        sql = """
-              UPDATE tmp_sync_calc
-              SET sync_status=?,
-                  sync_strategy = ?
-              WHERE sync_status = ?
-                AND src_uid = dst_uid
-              """
-        log.debug("Marking file sync state as %s.", SyncFileStatus.NOT_CHANGED)
-        cursor = self.conn.execute(
-            sql,
-            (
-                SyncFileStatus.NOT_CHANGED,
-                SyncStrategy.DO_NOTHING,
-                SyncFileStatus.UNKNOWN,
-            ),
-        )
-        log.info("%s files marked as %s.", cursor.rowcount, SyncFileStatus.NOT_CHANGED)
-
-        # TODO: check 0 count of SyncFileStatus.UNKNOWN
+        (unknown_count,) = self.conn.execute(
+            "SELECT COUNT(*) FROM tmp_sync_calc WHERE sync_status = ?",
+            (SyncFileStatus.UNKNOWN,),
+        ).fetchone()
+        if unknown_count:
+            msg = f"Synchronization could not classify {unknown_count} file(s)."
+            raise SyncPlanningError(msg)
 
     def sync_find_strategy(self) -> None:
         """Assign copy or delete strategies to unresolved entries.
 
         Prefer `IN_COPY` when matching content exists in the destination;
         otherwise use `OUT_COPY`. Assign `DELETE` to disappeared files.
+
+        Raises:
+            SyncPlanningError: If any entry has no strategy.
+
         """
         # Reuse matching content already present anywhere in the destination.
         sql = """
@@ -342,7 +305,19 @@ class SchizophreniaDBSync(SchizophreniaDBScan):
             SyncStrategy.DELETE,
             cursor.rowcount,
         )
-        # TODO: assert 0 UNDETERMINED left.
+        (unresolved_count,) = self.conn.execute(
+            """
+            SELECT COUNT(*) FROM tmp_sync_calc
+            WHERE sync_strategy IS NULL OR sync_strategy = ?
+            """,
+            (SyncStrategy.UNDETERMINED,),
+        ).fetchone()
+        if unresolved_count:
+            msg = (
+                "Synchronization could not assign a strategy "
+                f"to {unresolved_count} file(s)."
+            )
+            raise SyncPlanningError(msg)
 
     def sync_iter_solving_move_strategy(self) -> int:
         """Perform one pass replacing eligible local copies with moves.
