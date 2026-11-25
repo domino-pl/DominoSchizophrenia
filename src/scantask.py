@@ -223,12 +223,16 @@ class ScanTask:
                         log.info(
                             "Skipping identity file %s in %s.",
                             IDENTITY_FILE_NAME,
-                            IDENTITY_FILE_NAME,
+                            current_dir,
                         )
                         continue
 
                     file_path = current_dir / file
-                    if file_path.is_symlink() or not file_path.is_file():
+                    if file_path.is_symlink():
+                        log.info("Skipping symlink %s.", file_path)
+                        continue
+
+                    if not file_path.is_file():
                         raise UnsupportedFileTypeError(file_path)
 
                     file_stat = file_path.stat()
